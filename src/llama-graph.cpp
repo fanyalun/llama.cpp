@@ -1977,6 +1977,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        if (!cparams.offload_kqv) {
+            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2057,11 +2060,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    }
 
-        if (!cparams.offload_kqv) {
-            // all nodes between the KV store and the attention output are run on the CPU
-            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
-        }
+    if (!cparams.offload_kqv) {
+        // all nodes between the KV store and the attention output are run on the CPU
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
     }
 
     ggml_build_forward_expand(gf, cur);

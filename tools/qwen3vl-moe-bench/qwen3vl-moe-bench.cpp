@@ -189,7 +189,7 @@ static void print_usage(const char * argv0) {
     LOG("  --micro-prefill-tokens <n>                       default: 512\n");
     LOG("  --micro-decode-tokens <n>                        default: 1\n\n");
     LOG("recommended CPU-attention MoE offload run:\n");
-    LOG("  %s -m model.gguf --mode moe_cpu_offload --no-kv-offload --flash-attn off -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
+    LOG("  %s -m model.gguf --mode moe_cpu_offload --no-kv-offload --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
 }
 
 static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std::vector<std::string> & common_args) {
@@ -376,7 +376,6 @@ static common_params make_run_params(const common_params & base, const bench_par
         params.n_gpu_layers = 0;
         params.devices = { nullptr };
         params.no_kv_offload = true;
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         trim_tensor_overrides(params.tensor_buft_overrides);
         terminate_tensor_overrides(params.tensor_buft_overrides);
         return params;
@@ -384,7 +383,6 @@ static common_params make_run_params(const common_params & base, const bench_par
 
     if (mode == "moe_cpu_offload" || mode == "moe_cpu_sweep") {
         params.no_kv_offload = true;
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         apply_cpu_moe_overrides(params, n_cpu_moe_layers, owned_patterns);
         return params;
     }
@@ -561,6 +559,9 @@ static bool run_model_bench(
             cb.seq_len = seq_len;
             cb.repeat = rep;
             ggml_backend_moe_copy_stats_reset();
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=prefill start\n",
+                    mode_label.c_str(), seq_len, rep + 1, bench.repeats);
+            const int64_t t_prefill_start = ggml_time_us();
             if (!decode_range(ctx, batch, prompt_tokens, 0, seq_len, false)) {
                 LOG_ERR("%s: prefill failed for mode=%s seq_len=%d repeat=%d\n", __func__, mode_label.c_str(), seq_len, rep);
                 llama_batch_free(batch);
@@ -568,13 +569,21 @@ static bool run_model_bench(
                 llama_model_free(model);
                 return false;
             }
+            const int64_t t_prefill_end = ggml_time_us();
             auto st_prefill = ggml_backend_moe_copy_stats_get();
             copy_records.push_back({ mode_label, "prefill", seq_len, rep, st_prefill.calls, st_prefill.bytes, st_prefill.time_us });
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=prefill done total_ms=%.3f moe_copy_ms=%.3f\n",
+                    mode_label.c_str(), seq_len, rep + 1, bench.repeats,
+                    (t_prefill_end - t_prefill_start)/1000.0,
+                    st_prefill.time_us/1000.0);
 
             cb.phase = "decode";
             cb.seq_len = seq_len;
             cb.repeat = rep;
             ggml_backend_moe_copy_stats_reset();
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=decode start tokens=%d\n",
+                    mode_label.c_str(), seq_len, rep + 1, bench.repeats, bench.decode_tokens);
+            const int64_t t_decode_start = ggml_time_us();
             for (int32_t i = 0; i < bench.decode_tokens; ++i) {
                 std::vector<llama_token> one = { decode_tokens[(size_t) i] };
                 if (!decode_range(ctx, batch, one, seq_len + i, 1, true)) {
@@ -585,8 +594,13 @@ static bool run_model_bench(
                     return false;
                 }
             }
+            const int64_t t_decode_end = ggml_time_us();
             auto st_decode = ggml_backend_moe_copy_stats_get();
             copy_records.push_back({ mode_label, "decode", seq_len, rep, st_decode.calls, st_decode.bytes, st_decode.time_us });
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=decode done total_ms=%.3f moe_copy_ms=%.3f\n",
+                    mode_label.c_str(), seq_len, rep + 1, bench.repeats,
+                    (t_decode_end - t_decode_start)/1000.0,
+                    st_decode.time_us/1000.0);
         }
     }
 

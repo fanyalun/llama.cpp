@@ -18,7 +18,7 @@ Recommended run:
   --mode moe_cpu_offload \
   -ngl auto \
   --no-kv-offload \
-  --flash-attn off \
+  --flash-attn on \
   --lengths 8192,16384,32768,65536,131072 \
   --decode-tokens 16 \
   --repeats 5 \
