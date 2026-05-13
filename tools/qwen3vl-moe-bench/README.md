@@ -16,6 +16,7 @@ Recommended run:
 ./build/bin/llama-qwen3vl-moe-bench \
   -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
   --mode moe_cpu_offload \
+  --attention-backend cpu \
   -ngl auto \
   --no-kv-offload \
   --flash-attn on \
@@ -23,6 +24,21 @@ Recommended run:
   --decode-tokens 16 \
   --repeats 5 \
   --out-dir results/qwen3vl_moe_bench
+```
+
+GPU-attention run with experts still offloaded to CPU:
+
+```sh
+./build/bin/llama-qwen3vl-moe-bench \
+  -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
+  --mode moe_cpu_offload \
+  --attention-backend gpu \
+  -ngl auto \
+  --flash-attn on \
+  --lengths 8192,16384,32768,65536,131072 \
+  --decode-tokens 16 \
+  --repeats 5 \
+  --out-dir results/qwen3vl_moe_bench_gpu_attn
 ```
 
 CPU-only fallback:

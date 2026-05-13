@@ -27,6 +27,7 @@
 
 struct bench_params {
     std::string mode = "moe_cpu_offload";
+    std::string attention_backend = "cpu";
     std::string out_dir = "qwen3vl_moe_bench_results";
     std::vector<int32_t> lengths = { 8192, 16384, 32768, 65536, 131072 };
     std::vector<int32_t> n_cpu_moe_sweep = { 48, 36, 24, 12, 0 };
@@ -173,6 +174,7 @@ static void print_usage(const char * argv0) {
     LOG("  %s -m model.gguf [common llama.cpp args] [bench args]\n\n", argv0);
     LOG("bench args:\n");
     LOG("  --mode <cpu_full|moe_cpu_offload|moe_cpu_sweep>  default: moe_cpu_offload\n");
+    LOG("  --attention-backend <cpu|gpu>                     default: cpu, controls KV cache and KQV/FAttention placement for MoE offload modes\n");
     LOG("  --out-dir <dir>                                  default: qwen3vl_moe_bench_results\n");
     LOG("  --lengths <csv>                                  default: 8192,16384,32768,65536,131072\n");
     LOG("  --decode-tokens <n>                              default: 16\n");
@@ -190,6 +192,8 @@ static void print_usage(const char * argv0) {
     LOG("  --micro-decode-tokens <n>                        default: 1\n\n");
     LOG("recommended CPU-attention MoE offload run:\n");
     LOG("  %s -m model.gguf --mode moe_cpu_offload --no-kv-offload --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
+    LOG("recommended GPU-attention MoE offload run:\n");
+    LOG("  %s -m model.gguf --mode moe_cpu_offload --attention-backend gpu --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
 }
 
 static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std::vector<std::string> & common_args) {
@@ -211,6 +215,8 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 common_args.push_back(arg);
             } else if (arg == "--mode") {
                 bench.mode = need_value("--mode");
+            } else if (arg == "--attention-backend") {
+                bench.attention_backend = need_value("--attention-backend");
             } else if (arg == "--out-dir") {
                 bench.out_dir = need_value("--out-dir");
             } else if (arg == "--lengths") {
@@ -258,6 +264,10 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
     }
     if (bench.mode != "cpu_full" && bench.mode != "moe_cpu_offload" && bench.mode != "moe_cpu_sweep") {
         LOG_ERR("%s: unknown mode '%s'\n", __func__, bench.mode.c_str());
+        return false;
+    }
+    if (bench.attention_backend != "cpu" && bench.attention_backend != "gpu") {
+        LOG_ERR("%s: unknown attention backend '%s'\n", __func__, bench.attention_backend.c_str());
         return false;
     }
 
@@ -382,13 +392,23 @@ static common_params make_run_params(const common_params & base, const bench_par
     }
 
     if (mode == "moe_cpu_offload" || mode == "moe_cpu_sweep") {
-        params.no_kv_offload = true;
+        params.no_kv_offload = bench.attention_backend == "cpu";
         apply_cpu_moe_overrides(params, n_cpu_moe_layers, owned_patterns);
         return params;
     }
 
     (void) bench;
     return params;
+}
+
+static std::string make_mode_label(const bench_params & bench, const std::string & mode, int32_t n_cpu_moe_layers) {
+    if (mode == "moe_cpu_sweep") {
+        return "moe_cpu_sweep_n" + std::to_string(n_cpu_moe_layers) + "_attn_" + bench.attention_backend;
+    }
+    if (mode == "moe_cpu_offload") {
+        return "moe_cpu_offload_attn_" + bench.attention_backend;
+    }
+    return mode;
 }
 
 static int64_t meta_i64(const llama_model * model, const std::string & key, int64_t def) {
@@ -947,6 +967,7 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "\n```\n\n";
     report << "## Config\n\n";
     report << "- mode: `" << bench.mode << "`\n";
+    report << "- attention_backend: `" << bench.attention_backend << "`\n";
     report << "- repeats: `" << bench.repeats << "`\n";
     report << "- decode_tokens: `" << bench.decode_tokens << "`\n";
     report << "- profile_all_nodes: `" << (bench.profile_all_nodes ? 1 : 0) << "`\n";
@@ -1004,14 +1025,14 @@ int main(int argc, char ** argv) {
         if (bench.mode == "moe_cpu_sweep") {
             for (int32_t n_cpu_moe : bench.n_cpu_moe_sweep) {
                 std::vector<std::string> owned_patterns;
-                std::string mode_label = "moe_cpu_sweep_n" + std::to_string(n_cpu_moe);
+                std::string mode_label = make_mode_label(bench, "moe_cpu_sweep", n_cpu_moe);
                 common_params run_params = make_run_params(params, bench, "moe_cpu_sweep", n_cpu_moe, owned_patterns);
                 ok = run_model_bench(bench, run_params, mode_label, node_records, copy_records, info) && ok;
             }
         } else {
             std::vector<std::string> owned_patterns;
             common_params run_params = make_run_params(params, bench, bench.mode, bench.n_cpu_moe_layers, owned_patterns);
-            ok = run_model_bench(bench, run_params, bench.mode, node_records, copy_records, info) && ok;
+            ok = run_model_bench(bench, run_params, make_mode_label(bench, bench.mode, bench.n_cpu_moe_layers), node_records, copy_records, info) && ok;
         }
     }
 
