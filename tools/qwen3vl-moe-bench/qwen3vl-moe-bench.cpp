@@ -296,14 +296,14 @@ static bool parse_layer_name(const char * cname, std::string & base, int32_t & l
 }
 
 static bool is_attention_node(const std::string & base) {
-    return base == "fattn" ||
+    return base == "__fattn__" ||
+           base == "fattn_mla" ||
            base == "v_cont" ||
            base == "kq" ||
            base == "kqv" ||
-           base == "kqv_out" ||
-           base.rfind("kq_", 0) == 0 ||
-           base.rfind("kqv_", 0) == 0 ||
-           base.rfind("fattn_", 0) == 0;
+           base == "kqv_mla" ||
+           base == "kq_scaled" ||
+           base.rfind("kq_", 0) == 0;
 }
 
 static bool is_moe_node(const std::string & base) {
