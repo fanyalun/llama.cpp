@@ -707,7 +707,7 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
 
 static ggml_cgraph * build_group_graph(ggml_context * ctx, int32_t d_model, int32_t d_ff, int32_t n_experts, int32_t n_tokens) {
     ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, 1, n_tokens);
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, n_tokens);
     ggml_tensor * y = ggml_mul_mat_id(ctx, w, x, ids);
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -717,7 +717,7 @@ static ggml_cgraph * build_group_graph(ggml_context * ctx, int32_t d_model, int3
 
 static ggml_cgraph * build_serial_graph(ggml_context * ctx, int32_t d_model, int32_t d_ff, int32_t n_experts, int32_t n_tokens) {
     ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_model, n_tokens);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, n_tokens);
     ggml_tensor * acc = nullptr;
     for (int32_t i = 0; i < n_experts; ++i) {
         ggml_tensor * wi = ggml_view_2d(ctx, w, d_model, d_ff, w->nb[1], i*w->nb[2]);
@@ -736,6 +736,12 @@ static bool fill_graph_inputs(ggml_context * ctx) {
         }
         if (t->type == GGML_TYPE_F16) {
             auto data = make_f16_data((size_t) ggml_nelements(t));
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        } else if (t->type == GGML_TYPE_F32) {
+            std::vector<float> data((size_t) ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = ((int) (i % 17) - 8) / 64.0f;
+            }
             ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
         } else if (t->type == GGML_TYPE_I32) {
             std::vector<int32_t> ids((size_t) ggml_nelements(t));
