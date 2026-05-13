@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // CUDA AllReduce for tensor-parallel inference across two GPUs.
@@ -63,6 +64,17 @@ static __device__ __forceinline__ void ggml_cuda_ar_signal_set(int * p, int toke
 }
 static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
     return *(const volatile int *)p;
+}
+
+template <typename T>
+static __device__ __forceinline__ T ggml_cuda_ar_add(T a, T b) {
+    if constexpr (std::is_same_v<T, half>) {
+        return __float2half(__half2float(a) + __half2float(b));
+    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+    } else {
+        return a + b;
+    }
 }
 
 // Byte spacing between adjacent arrival ints.  64 bytes (one cache line)
@@ -184,13 +196,16 @@ static __global__ void ggml_cuda_ar_kernel(
             #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
                 const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
-                recvbuf[off + k] = ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(wire[k]);
+                recvbuf[off + k] = ggml_cuda_ar_add(
+                    ggml_cuda_cast<T_dst>(d_low),
+                    ggml_cuda_cast<T_dst>(wire[k]));
             }
         }
         if (bid == 0 && tid < count - tail) {
             const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
-            recvbuf[tail + tid] =
-                ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(host_other[tail + tid]);
+            recvbuf[tail + tid] = ggml_cuda_ar_add(
+                ggml_cuda_cast<T_dst>(d_low),
+                ggml_cuda_cast<T_dst>(host_other[tail + tid]));
         }
     }
 }
@@ -210,7 +225,9 @@ static __global__ void ggml_cuda_ar_add_kernel(
     const int nt  = gridDim.x * blockDim.x;
     for (int i = tid; i < count; i += nt) {
         const T_src d_low = ggml_cuda_cast<T_src>(dst[i]);
-        dst[i] = ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(src[i]);
+        dst[i] = ggml_cuda_ar_add(
+            ggml_cuda_cast<T_dst>(d_low),
+            ggml_cuda_cast<T_dst>(src[i]));
     }
 }
 
