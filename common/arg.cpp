@@ -782,6 +782,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-perplexity",
         "llama-q8dot",
         "llama-quantize",
+        "llama-qwen3vl-moe-bench",
         "llama-qwen2vl-cli",
         "llama-retrieval",
         "llama-save-load-state",

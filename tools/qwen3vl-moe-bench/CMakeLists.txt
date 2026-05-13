@@ -1,0 +1,9 @@
+set(TARGET llama-qwen3vl-moe-bench)
+add_executable(${TARGET} qwen3vl-moe-bench.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+    install(PROGRAMS plot_qwen3vl_moe_bench.py TYPE BIN)
+endif()

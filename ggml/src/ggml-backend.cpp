@@ -20,12 +20,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+static std::atomic<bool>     g_moe_copy_stats_enabled{false};
+static std::atomic<uint64_t> g_moe_copy_stats_calls{0};
+static std::atomic<uint64_t> g_moe_copy_stats_bytes{0};
+static std::atomic<uint64_t> g_moe_copy_stats_time_us{0};
+
+void ggml_backend_moe_copy_stats_set_enabled(bool enabled) {
+    g_moe_copy_stats_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+void ggml_backend_moe_copy_stats_reset(void) {
+    g_moe_copy_stats_calls.store(0, std::memory_order_relaxed);
+    g_moe_copy_stats_bytes.store(0, std::memory_order_relaxed);
+    g_moe_copy_stats_time_us.store(0, std::memory_order_relaxed);
+}
+
+struct ggml_backend_moe_copy_stats ggml_backend_moe_copy_stats_get(void) {
+    return {
+        g_moe_copy_stats_calls.load(std::memory_order_relaxed),
+        g_moe_copy_stats_bytes.load(std::memory_order_relaxed),
+        g_moe_copy_stats_time_us.load(std::memory_order_relaxed),
+    };
+}
 
 
 // backend buffer type
@@ -1627,12 +1651,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        const size_t copy_size = expert_size_copy + padding_end;
+                        const bool profile_copy = g_moe_copy_stats_enabled.load(std::memory_order_relaxed);
+                        const int64_t t_start_us = profile_copy ? ggml_time_us() : 0;
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                            copy_size);
+
+                        if (profile_copy) {
+                            ggml_backend_synchronize(split_backend);
+                            const int64_t t_end_us = ggml_time_us();
+                            g_moe_copy_stats_calls.fetch_add(1, std::memory_order_relaxed);
+                            g_moe_copy_stats_bytes.fetch_add(copy_size, std::memory_order_relaxed);
+                            g_moe_copy_stats_time_us.fetch_add((uint64_t) (t_end_us - t_start_us), std::memory_order_relaxed);
+                        }
                     };
 
                     int id = 0;
