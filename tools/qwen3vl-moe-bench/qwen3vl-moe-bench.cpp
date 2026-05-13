@@ -27,9 +27,11 @@
 
 struct bench_params {
     std::string mode = "moe_cpu_offload";
-    std::string attention_backend = "cpu";
+    std::string attention_backend = "gpu";
     std::string out_dir = "qwen3vl_moe_bench_results";
     std::vector<int32_t> lengths = { 8192, 16384, 32768, 65536, 131072 };
+    std::vector<int32_t> micro_tokens = { 256, 512, 1024, 2048, 4096 };
+    std::vector<int32_t> micro_experts_sweep = { 1, 2, 3, 4, 5, 6, 7, 8 };
     std::vector<int32_t> n_cpu_moe_sweep = { 48, 36, 24, 12, 0 };
     int32_t decode_tokens = 16;
     int32_t repeats = 3;
@@ -76,6 +78,8 @@ struct micro_record {
     std::string kind;
     std::string phase;
     int32_t tokens = 0;
+    int32_t active_tokens = 0;
+    int32_t experts = 0;
     int32_t repeat = 0;
     int64_t time_us = 0;
     uint64_t bytes = 0;
@@ -174,9 +178,11 @@ static void print_usage(const char * argv0) {
     LOG("  %s -m model.gguf [common llama.cpp args] [bench args]\n\n", argv0);
     LOG("bench args:\n");
     LOG("  --mode <cpu_full|moe_cpu_offload|moe_cpu_sweep>  default: moe_cpu_offload\n");
-    LOG("  --attention-backend <cpu|gpu>                     default: cpu, controls KV cache and KQV/FAttention placement for MoE offload modes\n");
+    LOG("  --attention-backend <cpu|gpu>                     default: gpu, controls KV cache and KQV/FAttention placement for MoE offload modes\n");
     LOG("  --out-dir <dir>                                  default: qwen3vl_moe_bench_results\n");
     LOG("  --lengths <csv>                                  default: 8192,16384,32768,65536,131072\n");
+    LOG("  --micro-tokens <csv>                             default: 256,512,1024,2048,4096\n");
+    LOG("  --micro-experts-sweep <csv>                      default: 1,2,3,4,5,6,7,8\n");
     LOG("  --decode-tokens <n>                              default: 16\n");
     LOG("  --repeats <n>                                    default: 3\n");
     LOG("  --n-cpu-moe-layers <n>                           for moe_cpu_offload; -1 means all experts\n");
@@ -188,10 +194,8 @@ static void print_usage(const char * argv0) {
     LOG("  --micro-experts <n>                              default: 8\n");
     LOG("  --micro-d-model <n>                              default: model n_embd or 2048\n");
     LOG("  --micro-d-ff <n>                                 default: model expert FFN or 4096\n");
-    LOG("  --micro-prefill-tokens <n>                       default: 512\n");
-    LOG("  --micro-decode-tokens <n>                        default: 1\n\n");
-    LOG("recommended CPU-attention MoE offload run:\n");
-    LOG("  %s -m model.gguf --mode moe_cpu_offload --no-kv-offload --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
+    LOG("  --micro-prefill-tokens <n>                       compatibility alias for --micro-tokens <n>\n");
+    LOG("  --micro-decode-tokens <n>                        default: 1 active token for decode labels\n\n");
     LOG("recommended GPU-attention MoE offload run:\n");
     LOG("  %s -m model.gguf --mode moe_cpu_offload --attention-backend gpu --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
 }
@@ -221,6 +225,10 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.out_dir = need_value("--out-dir");
             } else if (arg == "--lengths") {
                 bench.lengths = parse_i32_list(need_value("--lengths"));
+            } else if (arg == "--micro-tokens") {
+                bench.micro_tokens = parse_i32_list(need_value("--micro-tokens"));
+            } else if (arg == "--micro-experts-sweep") {
+                bench.micro_experts_sweep = parse_i32_list(need_value("--micro-experts-sweep"));
             } else if (arg == "--decode-tokens") {
                 bench.decode_tokens = std::stoi(need_value("--decode-tokens"));
             } else if (arg == "--repeats") {
@@ -241,12 +249,14 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 }
             } else if (arg == "--micro-experts") {
                 bench.micro_experts = std::stoi(need_value("--micro-experts"));
+                bench.micro_experts_sweep = { bench.micro_experts };
             } else if (arg == "--micro-d-model") {
                 bench.micro_d_model = std::stoi(need_value("--micro-d-model"));
             } else if (arg == "--micro-d-ff") {
                 bench.micro_d_ff = std::stoi(need_value("--micro-d-ff"));
             } else if (arg == "--micro-prefill-tokens") {
                 bench.micro_prefill_tokens = std::stoi(need_value("--micro-prefill-tokens"));
+                bench.micro_tokens = { bench.micro_prefill_tokens };
             } else if (arg == "--micro-decode-tokens") {
                 bench.micro_decode_tokens = std::stoi(need_value("--micro-decode-tokens"));
             } else {
@@ -258,7 +268,7 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
         }
     }
 
-    if (bench.lengths.empty() || bench.repeats <= 0 || bench.decode_tokens < 0) {
+    if (bench.lengths.empty() || bench.micro_tokens.empty() || bench.micro_experts_sweep.empty() || bench.repeats <= 0 || bench.decode_tokens < 0) {
         LOG_ERR("%s: invalid benchmark dimensions\n", __func__);
         return false;
     }
@@ -269,6 +279,12 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
     if (bench.attention_backend != "cpu" && bench.attention_backend != "gpu") {
         LOG_ERR("%s: unknown attention backend '%s'\n", __func__, bench.attention_backend.c_str());
         return false;
+    }
+    for (const int32_t h : bench.micro_experts_sweep) {
+        if (h <= 0) {
+            LOG_ERR("%s: invalid micro expert count %d\n", __func__, h);
+            return false;
+        }
     }
 
     return true;
@@ -714,7 +730,7 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(dst));
         ggml_backend_synchronize(backend);
         const int64_t t1 = ggml_time_us();
-        out.push_back({ "h2d_pinned", "copy", 0, rep, t1 - t0, (uint64_t) ggml_nbytes(dst) });
+        out.push_back({ "h2d_pinned", "copy", 0, 0, 1, rep, t1 - t0, (uint64_t) ggml_nbytes(dst) });
     }
 
     ggml_backend_buffer_free(gpu_buf);
@@ -726,22 +742,37 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
 }
 
 static ggml_cgraph * build_group_graph(ggml_context * ctx, int32_t d_model, int32_t d_ff, int32_t n_experts, int32_t n_tokens) {
-    ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, n_tokens);
-    ggml_tensor * y = ggml_mul_mat_id(ctx, w, x, ids);
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, n_experts);
+    ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, n_experts, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, n_tokens);
+
+    ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
+    ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
+    ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+    ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
+
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
     return gf;
 }
 
 static ggml_cgraph * build_serial_graph(ggml_context * ctx, int32_t d_model, int32_t d_ff, int32_t n_experts, int32_t n_tokens) {
-    ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, n_experts);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, n_tokens);
     ggml_tensor * acc = nullptr;
     for (int32_t i = 0; i < n_experts; ++i) {
-        ggml_tensor * wi = ggml_view_2d(ctx, w, d_model, d_ff, w->nb[1], i*w->nb[2]);
-        ggml_tensor * yi = ggml_mul_mat(ctx, wi, x);
+        ggml_tensor * gate_i = ggml_view_2d(ctx, gate, d_model, d_ff, gate->nb[1], i*gate->nb[2]);
+        ggml_tensor * up_i   = ggml_view_2d(ctx, up,   d_model, d_ff, up->nb[1],   i*up->nb[2]);
+        ggml_tensor * down_i = ggml_view_2d(ctx, down, d_ff, d_model, down->nb[1], i*down->nb[2]);
+
+        ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate_i, x);
+        ggml_tensor * ffn_up   = ggml_mul_mat(ctx, up_i,   x);
+        ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+        ggml_tensor * yi       = ggml_mul_mat(ctx, down_i, act);
         acc = acc ? ggml_add(ctx, acc, yi) : yi;
     }
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -780,13 +811,15 @@ static bool run_one_gemm_micro(
         ggml_backend_t backend,
         bool group,
         const std::string & phase,
-        int32_t tokens,
+        int32_t label_tokens,
+        int32_t active_tokens,
+        int32_t experts,
         const bench_params & bench,
         const model_info & info,
         std::vector<micro_record> & out) {
     const int32_t d_model = info.n_embd > 0 ? info.n_embd : bench.micro_d_model;
     const int32_t d_ff = info.n_ff_exp > 0 ? info.n_ff_exp : bench.micro_d_ff;
-    const int32_t n_experts = bench.micro_experts;
+    const int32_t n_experts = experts;
 
     const size_t mem_size = 64ULL*1024ULL*1024ULL;
     ggml_init_params init_params = {
@@ -797,8 +830,8 @@ static bool run_one_gemm_micro(
 
     ggml_context * ctx = ggml_init(init_params);
     ggml_cgraph * gf = group ?
-        build_group_graph(ctx, d_model, d_ff, n_experts, tokens) :
-        build_serial_graph(ctx, d_model, d_ff, n_experts, tokens);
+        build_group_graph(ctx, d_model, d_ff, n_experts, active_tokens) :
+        build_serial_graph(ctx, d_model, d_ff, n_experts, active_tokens);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (buf == nullptr) {
@@ -825,7 +858,7 @@ static bool run_one_gemm_micro(
             LOG_WRN("%s: microbench compute failed for %s/%s\n", __func__, group ? "group" : "serial", phase.c_str());
             break;
         }
-        out.push_back({ group ? "moe_group_gemm" : "moe_serial_gemm", phase, tokens, rep, t1 - t0, 0 });
+        out.push_back({ group ? "moe_group_gemm" : "moe_serial_gemm", phase, label_tokens, active_tokens, experts, rep, t1 - t0, 0 });
     }
 
     ggml_backend_buffer_free(buf);
@@ -846,10 +879,14 @@ static bool run_gemm_microbench(const bench_params & bench, const model_info & i
         return true;
     }
 
-    run_one_gemm_micro(backend, true,  "prefill", bench.micro_prefill_tokens, bench, info, out);
-    run_one_gemm_micro(backend, false, "prefill", bench.micro_prefill_tokens, bench, info, out);
-    run_one_gemm_micro(backend, true,  "decode",  bench.micro_decode_tokens,  bench, info, out);
-    run_one_gemm_micro(backend, false, "decode",  bench.micro_decode_tokens,  bench, info, out);
+    for (const int32_t h : bench.micro_experts_sweep) {
+        for (const int32_t tokens : bench.micro_tokens) {
+            run_one_gemm_micro(backend, true,  "prefill", tokens, tokens, h, bench, info, out);
+            run_one_gemm_micro(backend, false, "prefill", tokens, tokens, h, bench, info, out);
+            run_one_gemm_micro(backend, true,  "decode",  tokens, bench.micro_decode_tokens, h, bench, info, out);
+            run_one_gemm_micro(backend, false, "decode",  tokens, bench.micro_decode_tokens, h, bench, info, out);
+        }
+    }
 
     ggml_backend_free(backend);
     return true;
@@ -878,6 +915,8 @@ static void write_raw_jsonl(
         jsonl << "{\"kind\":\"" << json_escape(rec.kind) << "\""
               << ",\"phase\":\"" << json_escape(rec.phase) << "\""
               << ",\"tokens\":" << rec.tokens
+              << ",\"active_tokens\":" << rec.active_tokens
+              << ",\"experts\":" << rec.experts
               << ",\"repeat\":" << rec.repeat
               << ",\"time_us\":" << rec.time_us
               << ",\"bytes\":" << rec.bytes
@@ -930,11 +969,11 @@ static void write_summary_csv(
 
     for (const auto & rec : micros) {
         std::ostringstream key;
-        key << rec.kind << ",micro," << rec.phase << "," << rec.tokens << ",-1,time_us";
+        key << rec.kind << ",micro_h" << rec.experts << "," << rec.phase << "," << rec.tokens << ",-1,time_us";
         buckets[key.str()].values.push_back((double) rec.time_us);
         if (rec.bytes > 0) {
             std::ostringstream kb;
-            kb << rec.kind << ",micro," << rec.phase << "," << rec.tokens << ",-1,bytes";
+            kb << rec.kind << ",micro_h" << rec.experts << "," << rec.phase << "," << rec.tokens << ",-1,bytes";
             buckets[kb.str()].values.push_back((double) rec.bytes);
         }
     }
@@ -971,12 +1010,29 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- repeats: `" << bench.repeats << "`\n";
     report << "- decode_tokens: `" << bench.decode_tokens << "`\n";
     report << "- profile_all_nodes: `" << (bench.profile_all_nodes ? 1 : 0) << "`\n";
+    report << "- micro tokens: `";
+    for (size_t i = 0; i < bench.micro_tokens.size(); ++i) {
+        if (i) {
+            report << ",";
+        }
+        report << bench.micro_tokens[i];
+    }
+    report << "`\n";
+    report << "- micro experts sweep: `";
+    for (size_t i = 0; i < bench.micro_experts_sweep.size(); ++i) {
+        if (i) {
+            report << ",";
+        }
+        report << bench.micro_experts_sweep[i];
+    }
+    report << "`\n";
+    report << "- micro decode active tokens: `" << bench.micro_decode_tokens << "`\n";
     report << "- model layers: `" << info.n_layer << "`\n";
     report << "- model embedding: `" << info.n_embd << "`\n";
     report << "- experts: `" << info.n_expert << "`\n";
     report << "- expert FFN: `" << info.n_ff_exp << "`\n\n";
     report << "## Outputs\n\n";
-    report << "- `results.jsonl`: raw node, attention-layer, runtime MoE-copy, and microbench records\n";
+    report << "- `results.jsonl`: raw node, attention-layer, runtime MoE-copy, pinned H2D copy, and microbench records\n";
     report << "- `summary.csv`: aggregated averages and stddevs\n";
     report << "- `plots/*.svg`: generated by `plot_qwen3vl_moe_bench.py`\n\n";
     report << "Note: runtime MoE-copy profiling synchronizes the destination backend around used-expert copies, so it is for measurement rather than maximum-throughput serving.\n";
@@ -1000,6 +1056,10 @@ int main(int argc, char ** argv) {
         print_usage(argv_inner[0]);
     })) {
         return 1;
+    }
+    if (bench.mode == "moe_cpu_offload" && bench.attention_backend == "gpu" &&
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
     const int32_t max_len = *std::max_element(bench.lengths.begin(), bench.lengths.end());

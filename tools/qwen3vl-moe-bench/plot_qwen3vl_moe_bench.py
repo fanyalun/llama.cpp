@@ -2,8 +2,24 @@
 
 import argparse
 import csv
+import html
 import math
+from collections import defaultdict
 from pathlib import Path
+
+
+COLORS = [
+    "#0f766e",
+    "#b45309",
+    "#2563eb",
+    "#be123c",
+    "#4d7c0f",
+    "#7c3aed",
+    "#334155",
+    "#0891b2",
+    "#c2410c",
+    "#4338ca",
+]
 
 
 def read_summary(path):
@@ -33,18 +49,34 @@ def nice_max(value):
     return nice * (10 ** exp)
 
 
-def write_svg(path, title, series, x_label, y_label):
+def fmt_x(x):
+    if x >= 1024 and x % 1024 == 0:
+        return f"{int(x // 1024)}K"
+    return str(int(x))
+
+
+def line_svg(f, x1, y1, x2, y2, color="#111827", width=1.0):
+    f.write(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{color}" stroke-width="{width}"/>\n')
+
+
+def text_svg(f, x, y, text, size=12, anchor="middle", weight="400", color="#111827", rotate=None):
+    transform = f' transform="rotate({rotate} {x:.1f} {y:.1f})"' if rotate is not None else ""
+    f.write(
+        f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}" font-family="Arial" '
+        f'font-size="{size}" font-weight="{weight}" fill="{color}"{transform}>{html.escape(text)}</text>\n'
+    )
+
+
+def plot_lines(path, title, series, x_label, y_label):
     width, height = 900, 520
-    left, right, top, bottom = 78, 28, 54, 72
+    left, right, top, bottom = 78, 28, 54, 88
     plot_w = width - left - right
     plot_h = height - top - bottom
-    colors = ["#0f766e", "#b45309", "#2563eb", "#be123c", "#4d7c0f", "#7c3aed", "#334155"]
-
     points = [p for _, pts in series for p in pts]
     if not points:
         return
 
-    xs = [p[0] for p in points]
+    xs = sorted(set(p[0] for p in points))
     ys = [p[1] for p in points]
     x_min, x_max = min(xs), max(xs)
     if x_min == x_max:
@@ -60,36 +92,110 @@ def write_svg(path, title, series, x_label, y_label):
     with open(path, "w") as f:
         f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
         f.write('<rect width="100%" height="100%" fill="#ffffff"/>\n')
-        f.write(f'<text x="{left}" y="32" font-family="Arial" font-size="22" font-weight="700" fill="#111827">{title}</text>\n')
-        f.write(f'<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#111827"/>\n')
-        f.write(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#111827"/>\n')
+        text_svg(f, left, 32, title, size=22, anchor="start", weight="700")
+        line_svg(f, left, top + plot_h, left + plot_w, top + plot_h)
+        line_svg(f, left, top, left, top + plot_h)
 
         for i in range(6):
             y = y_max * i / 5
             yy = sy(y)
-            f.write(f'<line x1="{left}" y1="{yy:.1f}" x2="{left + plot_w}" y2="{yy:.1f}" stroke="#e5e7eb"/>\n')
-            f.write(f'<text x="{left - 10}" y="{yy + 4:.1f}" text-anchor="end" font-family="Arial" font-size="12" fill="#374151">{y:.2g}</text>\n')
+            line_svg(f, left, yy, left + plot_w, yy, color="#e5e7eb")
+            text_svg(f, left - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
 
-        for x in sorted(set(xs)):
+        for x in xs:
             xx = sx(x)
-            f.write(f'<line x1="{xx:.1f}" y1="{top + plot_h}" x2="{xx:.1f}" y2="{top + plot_h + 5}" stroke="#111827"/>\n')
-            f.write(f'<text x="{xx:.1f}" y="{top + plot_h + 23}" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">{int(x)}</text>\n')
+            line_svg(f, xx, top + plot_h, xx, top + plot_h + 5)
+            text_svg(f, xx, top + plot_h + 23, fmt_x(x), color="#374151")
 
         for idx, (name, pts) in enumerate(series):
-            color = colors[idx % len(colors)]
+            color = COLORS[idx % len(COLORS)]
             pts = sorted(pts)
             path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
             f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.5"/>\n')
             for x, y in pts:
                 f.write(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="3.5" fill="{color}"/>\n')
             lx = left + 16 + (idx % 3) * 250
-            ly = top + plot_h + 48 + (idx // 3) * 18
-            f.write(f'<line x1="{lx}" y1="{ly - 4}" x2="{lx + 22}" y2="{ly - 4}" stroke="{color}" stroke-width="2.5"/>\n')
-            f.write(f'<text x="{lx + 30}" y="{ly}" font-family="Arial" font-size="12" fill="#111827">{name}</text>\n')
+            ly = top + plot_h + 50 + (idx // 3) * 18
+            line_svg(f, lx, ly - 4, lx + 22, ly - 4, color=color, width=2.5)
+            text_svg(f, lx + 30, ly, name, anchor="start")
 
-        f.write(f'<text x="{left + plot_w / 2}" y="{height - 12}" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827">{x_label}</text>\n')
-        f.write(f'<text x="18" y="{top + plot_h / 2}" transform="rotate(-90 18 {top + plot_h / 2})" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827">{y_label}</text>\n')
+        text_svg(f, left + plot_w / 2, height - 14, x_label, size=13)
+        text_svg(f, 18, top + plot_h / 2, y_label, size=13, rotate=-90)
         f.write("</svg>\n")
+
+
+def plot_moe_gemm(path, panels):
+    width, height = 1120, 620
+    left, right, top, bottom = 72, 28, 70, 124
+    gap = 54
+    panel_w = (width - left - right - gap) / 2
+    panel_h = height - top - bottom
+    all_points = [p for _, series in panels for _, pts in series for p in pts]
+    if not all_points:
+        return
+
+    xs = sorted(set(p[0] for p in all_points))
+    x_min, x_max = min(xs), max(xs)
+    if x_min == x_max:
+        x_min = 0
+    y_max = nice_max(max(p[1] for p in all_points))
+
+    def sx(x, panel_idx):
+        px = left + panel_idx * (panel_w + gap)
+        return px + (x - x_min) / (x_max - x_min) * panel_w
+
+    def sy(y):
+        return top + panel_h - y / y_max * panel_h
+
+    with open(path, "w") as f:
+        f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
+        f.write('<rect width="100%" height="100%" fill="#ffffff"/>\n')
+        text_svg(f, left, 34, "MoE GEMM FFN", size=22, anchor="start", weight="700")
+
+        for pidx, (panel_name, series) in enumerate(panels):
+            px = left + pidx * (panel_w + gap)
+            text_svg(f, px + panel_w / 2, top - 18, panel_name.title(), size=15, weight="700")
+            line_svg(f, px, top + panel_h, px + panel_w, top + panel_h)
+            line_svg(f, px, top, px, top + panel_h)
+            for i in range(6):
+                y = y_max * i / 5
+                yy = sy(y)
+                line_svg(f, px, yy, px + panel_w, yy, color="#e5e7eb")
+                text_svg(f, px - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
+            for x in xs:
+                xx = sx(x, pidx)
+                line_svg(f, xx, top + panel_h, xx, top + panel_h + 5)
+                text_svg(f, xx, top + panel_h + 23, fmt_x(x), color="#374151")
+            for idx, (name, pts) in enumerate(series):
+                color = COLORS[idx % len(COLORS)]
+                dash = ' stroke-dasharray="5 4"' if name.startswith("serial") else ""
+                pts = sorted(pts)
+                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
+                f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.0"{dash}/>\n')
+
+        legend_items = []
+        for h in range(1, 9):
+            legend_items.append((f"group h={h}", COLORS[(h - 1) % len(COLORS)], False))
+        for h in range(1, 9):
+            legend_items.append((f"serial h={h}", COLORS[(h - 1) % len(COLORS)], True))
+        for idx, (name, color, dashed) in enumerate(legend_items):
+            lx = left + 10 + (idx % 4) * 250
+            ly = top + panel_h + 56 + (idx // 4) * 18
+            dash = ' stroke-dasharray="5 4"' if dashed else ""
+            f.write(f'<line x1="{lx:.1f}" y1="{ly - 4:.1f}" x2="{lx + 22:.1f}" y2="{ly - 4:.1f}" stroke="{color}" stroke-width="2.0"{dash}/>\n')
+            text_svg(f, lx + 30, ly, name, anchor="start")
+
+        text_svg(f, left + (width - left - right) / 2, height - 14, "tokens", size=13)
+        text_svg(f, 18, top + panel_h / 2, "time (ms)", size=13, rotate=-90)
+        f.write("</svg>\n")
+
+
+def average_attention(rows):
+    grouped = defaultdict(list)
+    for r in rows:
+        if r["kind"] == "attention_layer" and r["metric"] == "time_us":
+            grouped[(r["phase"], r["x"])].append(r["avg"] / 1000.0)
+    return {k: sum(v) / len(v) for k, v in grouped.items() if v}
 
 
 def main():
@@ -102,38 +208,40 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    attn = average_attention(rows)
+    attention_series = []
     for phase in ["prefill", "decode"]:
-        attention = [r for r in rows if r["kind"] == "attention_layer" and r["phase"] == phase and r["metric"] == "time_us"]
-        if attention:
-            modes = sorted(set(r["mode"] for r in attention))
-            series = []
-            for mode in modes:
-                xs = sorted(set(r["x"] for r in attention if r["mode"] == mode))
-                pts = []
-                for x in xs:
-                    vals = [r["avg"] / 1000.0 for r in attention if r["mode"] == mode and r["x"] == x]
-                    if vals:
-                        pts.append((x, sum(vals) / len(vals)))
-                series.append((mode, pts))
-            write_svg(out_dir / f"attention_{phase}.svg", f"Attention {phase}", series, "sequence length", "avg layer time (ms)")
+        pts = sorted((x, y) for (p, x), y in attn.items() if p == phase)
+        if pts:
+            attention_series.append((phase, pts))
+    plot_lines(out_dir / "figure1_attention_time.svg", "Attention Time", attention_series, "sequence length", "avg layer time (ms)")
 
-    copy_rows = [r for r in rows if r["kind"] == "moe_copy_runtime" and r["metric"] == "time_us"]
-    if copy_rows:
+    copy_times = [r["avg"] / 1000.0 for r in rows if r["kind"] == "h2d_pinned" and r["metric"] == "time_us"]
+    if copy_times:
+        copy_time = sum(copy_times) / len(copy_times)
+        ratio_series = []
+        for phase in ["prefill", "decode"]:
+            pts = sorted((x, y / copy_time) for (p, x), y in attn.items() if p == phase and copy_time > 0)
+            if pts:
+                ratio_series.append((phase, pts))
+        plot_lines(out_dir / "figure2_attention_copy_ratio.svg", "Attention / H2D Copy", ratio_series, "sequence length", "ratio")
+
+    panels = []
+    for phase in ["prefill", "decode"]:
         series = []
-        for phase in sorted(set(r["phase"] for r in copy_rows)):
-            pts = [(r["x"], r["avg"] / 1000.0) for r in copy_rows if r["phase"] == phase]
-            series.append((phase, pts))
-        write_svg(out_dir / "moe_copy_runtime.svg", "Runtime MoE Expert Copy", series, "sequence length", "time (ms)")
-
-    gemm_rows = [r for r in rows if r["kind"] in ("moe_group_gemm", "moe_serial_gemm") and r["metric"] == "time_us"]
-    if gemm_rows:
-        for phase in sorted(set(r["phase"] for r in gemm_rows)):
-            series = []
-            for kind in ["moe_group_gemm", "moe_serial_gemm"]:
-                pts = [(r["x"], r["avg"] / 1000.0) for r in gemm_rows if r["kind"] == kind and r["phase"] == phase]
+        for h in range(1, 9):
+            mode = f"micro_h{h}"
+            for kind, label in [("moe_group_gemm", f"group h={h}"), ("moe_serial_gemm", f"serial h={h}")]:
+                pts = [
+                    (r["x"], r["avg"] / 1000.0)
+                    for r in rows
+                    if r["kind"] == kind and r["mode"] == mode and r["phase"] == phase and r["metric"] == "time_us"
+                ]
                 if pts:
-                    series.append((kind, pts))
-            write_svg(out_dir / f"moe_gemm_{phase}.svg", f"MoE GEMM {phase}", series, "tokens", "time (ms)")
+                    series.append((label, pts))
+        if series:
+            panels.append((phase, series))
+    plot_moe_gemm(out_dir / "figure3_moe_gemm.svg", panels)
 
 
 if __name__ == "__main__":
