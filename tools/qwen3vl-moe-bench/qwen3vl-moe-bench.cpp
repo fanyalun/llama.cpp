@@ -215,6 +215,12 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
             }
             return argv[++i];
         };
+        auto optional_bool_value = [&](bool default_value) -> bool {
+            if (i + 1 >= argc || std::string(argv[i + 1]).rfind("-", 0) == 0) {
+                return default_value;
+            }
+            return std::stoi(argv[++i]) != 0;
+        };
 
         try {
             if (arg == "--help" || arg == "-h") {
@@ -244,11 +250,11 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
             } else if (arg == "--n-cpu-moe-sweep") {
                 bench.n_cpu_moe_sweep = parse_i32_list(need_value("--n-cpu-moe-sweep"));
             } else if (arg == "--skip-model-bench") {
-                bench.skip_model_bench = std::stoi(need_value("--skip-model-bench")) != 0;
+                bench.skip_model_bench = optional_bool_value(true);
             } else if (arg == "--skip-microbench") {
-                bench.skip_microbench = std::stoi(need_value("--skip-microbench")) != 0;
+                bench.skip_microbench = optional_bool_value(true);
             } else if (arg == "--profile-all-nodes") {
-                bench.profile_all_nodes = std::stoi(need_value("--profile-all-nodes")) != 0;
+                bench.profile_all_nodes = optional_bool_value(true);
             } else if (arg == "--expert-bytes") {
                 if (!parse_size_bytes(need_value("--expert-bytes"), bench.expert_bytes)) {
                     throw std::invalid_argument("invalid --expert-bytes");
