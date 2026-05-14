@@ -118,11 +118,12 @@ from the AIME allresults JSON:
 ```
 
 `--prompt-json` changes the prefill GEMM sweep from synthetic long-tail routing
-to real `ffn_moe_topk` routing collected at `--route-layer`. The prompt text is
-read from each JSON HTML entry's `Prompt conversation` block, tokenized by the
-loaded model, and clipped to each `--micro-tokens` length. Prompts shorter than a
-target length are skipped. Use `--route-max-prompts 0` to collect all eligible
-prompts for each length.
+to real `ffn_moe_topk` routing collected at `--route-layer`. Prompt text is read
+from each JSON HTML entry's `Prompt conversation` block, tokenized by the loaded
+model, packed by concatenating multiple prompts with blank-line separators, and
+clipped to each `--micro-tokens` length. Each packed sample starts from a
+different prompt offset. Use `--route-max-prompts 0` to collect one packed sample
+starting at every prompt for each length.
 
 The Alpha sweep splits active experts by expert id order. The first
 `floor(active_experts * alpha / 100)` experts use Group GEMM, and the remaining

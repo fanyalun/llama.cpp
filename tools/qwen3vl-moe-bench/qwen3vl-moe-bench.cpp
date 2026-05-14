@@ -103,6 +103,7 @@ struct route_record {
     int32_t seq_len = 0;
     int32_t sample = 0;
     int32_t original_tokens = 0;
+    int32_t packed_prompts = 0;
     int32_t layer = -1;
     std::vector<int64_t> expert_counts;
 };
@@ -690,6 +691,37 @@ static std::vector<std::string> load_aime_prompt_json(const std::string & path) 
     return prompts;
 }
 
+static std::vector<llama_token> pack_prompt_tokens(
+        const std::vector<std::vector<llama_token>> & first_tokens,
+        const std::vector<std::vector<llama_token>> & next_tokens,
+        const std::vector<llama_token> & sep_tokens,
+        size_t start,
+        int32_t seq_len,
+        int32_t & packed_prompts) {
+    std::vector<llama_token> packed;
+    packed_prompts = 0;
+    if (first_tokens.empty() || seq_len <= 0) {
+        return packed;
+    }
+
+    const size_t n_prompts = first_tokens.size();
+    size_t idx = start % n_prompts;
+    while ((int32_t) packed.size() < seq_len) {
+        const auto & piece = packed_prompts == 0 ? first_tokens[idx] : next_tokens[idx];
+        if (packed_prompts > 0) {
+            packed.insert(packed.end(), sep_tokens.begin(), sep_tokens.end());
+        }
+        packed.insert(packed.end(), piece.begin(), piece.end());
+        packed_prompts++;
+        idx = (idx + 1) % n_prompts;
+    }
+
+    if ((int32_t) packed.size() > seq_len) {
+        packed.resize((size_t) seq_len);
+    }
+    return packed;
+}
+
 static bool decode_range(llama_context * ctx, llama_batch & batch, const std::vector<llama_token> & tokens, int32_t pos0, int32_t n_tokens, bool logits_last) {
     const uint32_t n_batch = std::max<uint32_t>(1, llama_n_batch(ctx));
     int32_t done = 0;
@@ -921,11 +953,15 @@ static bool collect_real_route_distributions(
     info.n_ff_exp = (int32_t) meta_i64(model, arch + ".expert_feed_forward_length", info.n_ff_exp);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    std::vector<std::vector<llama_token>> tokenized;
-    tokenized.reserve(prompts.size());
+    std::vector<std::vector<llama_token>> first_tokens;
+    std::vector<std::vector<llama_token>> next_tokens;
+    first_tokens.reserve(prompts.size());
+    next_tokens.reserve(prompts.size());
     for (const std::string & prompt : prompts) {
-        tokenized.push_back(common_tokenize(vocab, prompt, true, true));
+        first_tokens.push_back(common_tokenize(vocab, prompt, true, true));
+        next_tokens.push_back(common_tokenize(vocab, prompt, false, true));
     }
+    const std::vector<llama_token> sep_tokens = common_tokenize(vocab, "\n\n", false, true);
 
     callback_data cb;
     cb.profile_all_nodes = false;
@@ -957,26 +993,24 @@ static bool collect_real_route_distributions(
             continue;
         }
 
-        int32_t collected = 0;
-        for (size_t sample = 0; sample < tokenized.size(); ++sample) {
-            if (bench.route_max_prompts > 0 && collected >= bench.route_max_prompts) {
-                break;
-            }
-            const auto & toks = tokenized[sample];
-            if ((int32_t) toks.size() < seq_len) {
+        const int32_t samples_to_collect = bench.route_max_prompts > 0 ? bench.route_max_prompts : (int32_t) prompts.size();
+        for (int32_t sample = 0; sample < samples_to_collect; ++sample) {
+            int32_t packed_prompts = 0;
+            std::vector<llama_token> clipped = pack_prompt_tokens(first_tokens, next_tokens, sep_tokens, (size_t) sample, seq_len, packed_prompts);
+            if ((int32_t) clipped.size() < seq_len) {
+                LOG_WRN("%s: failed to pack enough tokens for seq_len=%d sample=%d\n", __func__, seq_len, sample);
                 continue;
             }
 
-            std::vector<llama_token> clipped(toks.begin(), toks.begin() + seq_len);
             std::vector<int64_t> counts((size_t) std::max(0, info.n_expert), 0);
             cb.seq_len = seq_len;
-            cb.repeat = (int32_t) sample;
+            cb.repeat = sample;
             cb.route_counts = &counts;
 
             llama_memory_clear(mem, false);
-            LOG_INF("route: seq_len=%d sample=%zu layer=%d start\n", seq_len, sample, bench.route_layer);
+            LOG_INF("route: seq_len=%d sample=%d packed_prompts=%d layer=%d start\n", seq_len, sample, packed_prompts, bench.route_layer);
             if (!decode_range(ctx, batch, clipped, 0, seq_len, false)) {
-                LOG_ERR("%s: route collection failed for seq_len=%d sample=%zu\n", __func__, seq_len, sample);
+                LOG_ERR("%s: route collection failed for seq_len=%d sample=%d\n", __func__, seq_len, sample);
                 llama_batch_free(batch);
                 llama_free(ctx);
                 llama_model_free(model);
@@ -985,18 +1019,15 @@ static bool collect_real_route_distributions(
 
             routes.push_back({
                 seq_len,
-                (int32_t) sample,
-                (int32_t) toks.size(),
+                sample,
+                (int32_t) clipped.size(),
+                packed_prompts,
                 bench.route_layer,
                 std::move(counts),
             });
-            collected++;
-            LOG_INF("route: seq_len=%d sample=%zu layer=%d done\n", seq_len, sample, bench.route_layer);
+            LOG_INF("route: seq_len=%d sample=%d packed_prompts=%d layer=%d done\n", seq_len, sample, packed_prompts, bench.route_layer);
         }
 
-        if (collected == 0) {
-            LOG_WRN("%s: no prompt in %s has enough tokens for seq_len=%d\n", __func__, bench.prompt_json.c_str(), seq_len);
-        }
     }
 
     llama_batch_free(batch);
@@ -1631,6 +1662,7 @@ static void write_raw_jsonl(
               << ",\"seq_len\":" << rec.seq_len
               << ",\"sample\":" << rec.sample
               << ",\"original_tokens\":" << rec.original_tokens
+              << ",\"packed_prompts\":" << rec.packed_prompts
               << ",\"layer\":" << rec.layer
               << ",\"expert_counts\":[";
         for (size_t i = 0; i < rec.expert_counts.size(); ++i) {
