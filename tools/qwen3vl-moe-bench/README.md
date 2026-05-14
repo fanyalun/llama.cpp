@@ -85,6 +85,27 @@ the model benchmark:
   --out-dir results/qwen3vl_expert_copy
 ```
 
+Measure the Alpha MoE GEMM sweep without rerunning the model benchmark:
+
+```sh
+./build/bin/llama-qwen3vl-moe-bench \
+  -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
+  --skip-model-bench \
+  --skip-gemm-microbench 0 \
+  --micro-tokens 1024,2048,4096,8192,16384,32768 \
+  --micro-alpha-pcts 0,25,50,75,100 \
+  --repeats 3 \
+  -ngl auto \
+  --out-dir results/qwen3vl_moe_gemm
+```
+
+The Alpha sweep splits active experts by expert id order. The first
+`floor(active_experts * alpha / 100)` experts use Group GEMM, and the remaining
+experts use Serial GEMM. Prefill uses the model expert count as active experts
+and distributes input tokens with a fixed `N,N-1,...,1` long-tail weight after
+assigning one token per expert. Decode uses one token with Top-K `8` active
+experts and records one row per alpha.
+
 Then combine the existing Attention summary with the expert-copy summary for
 the ratio plot:
 
@@ -97,9 +118,9 @@ python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
 
 Outputs:
 
-- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, and microbench records.
-- `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Microbench rows use `mode=micro_hN` for the active expert-count sweep.
+- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, and microbench records. Alpha GEMM records include `alpha_pct`, `group_experts`, `serial_experts`, and `active_experts`.
+- `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Alpha GEMM rows use `mode=micro_alphaN`.
 - `plots/figure1_attention_time.svg`: prefill/decode average per-layer Attention time.
 - `plots/figure2_attention_expert_copy_ratio.svg`: `KV CPU + Attn CPU` average per-layer Attention time divided by one routed expert pinned H2D copy time.
-- `plots/figure3_moe_gemm.svg`: Serial vs Group GEMM full expert FFN sweep for `h=1..8`.
+- `plots/figure3_moe_gemm.svg`: Alpha sweep with Prefill and Decode panels on independent y axes.
 - `report.md`: command and configuration snapshot.

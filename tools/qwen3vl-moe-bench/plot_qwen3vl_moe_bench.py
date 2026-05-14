@@ -279,27 +279,32 @@ def plot_moe_gemm(path, panels):
     gap = 54
     panel_w = (width - left - right - gap) / 2
     panel_h = height - top - bottom
-    all_points = [p for _, series in panels for _, pts in series for p in pts]
-    if not all_points:
+    if not any(pts for _, series in panels for _, pts in series):
         return
 
-    xs = sorted(set(p[0] for p in all_points))
-    x_min, x_max = min(xs), max(xs)
-    if x_min == x_max:
-        x_min = 0
-    y_max = nice_max(max(p[1] for p in all_points))
+    panel_xs = []
+    panel_y_max = []
+    for _, series in panels:
+        points = [p for _, pts in series for p in pts]
+        xs = sorted(set(p[0] for p in points))
+        x_min, x_max = min(xs), max(xs)
+        if x_min == x_max:
+            x_min = 0
+        panel_xs.append((xs, x_min, x_max))
+        panel_y_max.append(nice_max(max(p[1] for p in points)))
 
     def sx(x, panel_idx):
         px = left + panel_idx * (panel_w + gap)
+        _, x_min, x_max = panel_xs[panel_idx]
         return px + (x - x_min) / (x_max - x_min) * panel_w
 
-    def sy(y):
-        return top + panel_h - y / y_max * panel_h
+    def sy(y, panel_idx):
+        return top + panel_h - y / panel_y_max[panel_idx] * panel_h
 
     with open(path, "w") as f:
         f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
         f.write('<rect width="100%" height="100%" fill="#ffffff"/>\n')
-        text_svg(f, left, 34, "MoE GEMM FFN", size=22, anchor="start", weight="700")
+        text_svg(f, left, 34, "MoE GEMM Alpha Sweep", size=22, anchor="start", weight="700")
 
         for pidx, (panel_name, series) in enumerate(panels):
             px = left + pidx * (panel_w + gap)
@@ -307,40 +312,36 @@ def plot_moe_gemm(path, panels):
             line_svg(f, px, top + panel_h, px + panel_w, top + panel_h)
             line_svg(f, px, top, px, top + panel_h)
             for i in range(6):
-                y = y_max * i / 5
-                yy = sy(y)
+                y = panel_y_max[pidx] * i / 5
+                yy = sy(y, pidx)
                 line_svg(f, px, yy, px + panel_w, yy, color="#e5e7eb")
                 text_svg(f, px - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
+            xs = panel_xs[pidx][0]
             for x in xs:
                 xx = sx(x, pidx)
                 line_svg(f, xx, top + panel_h, xx, top + panel_h + 5)
-                text_svg(f, xx, top + panel_h + 23, fmt_x(x), color="#374151")
+                text_svg(f, xx, top + panel_h + 23, f"{int(x)}", color="#374151")
             for idx, (name, pts) in enumerate(series):
                 color = COLORS[idx % len(COLORS)]
-                dash = ' stroke-dasharray="5 4"' if name.startswith("serial") else ""
                 pts = sorted(pts)
-                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
-                f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.0"{dash}/>\n')
+                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y, pidx):.1f}" for i, (x, y) in enumerate(pts))
+                f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.2"/>\n')
+                for x, y in pts:
+                    f.write(f'<circle cx="{sx(x, pidx):.1f}" cy="{sy(y, pidx):.1f}" r="3.2" fill="{color}"/>\n')
 
-        hs = sorted({
-            int(name.rsplit("=", 1)[1])
-            for _, series in panels
-            for name, _ in series
-            if "=" in name
-        })
         legend_items = []
-        for h in hs:
-            legend_items.append((f"group h={h}", COLORS[(h - 1) % len(COLORS)], False))
-        for h in hs:
-            legend_items.append((f"serial h={h}", COLORS[(h - 1) % len(COLORS)], True))
-        for idx, (name, color, dashed) in enumerate(legend_items):
+        for _, series in panels:
+            for idx, (name, _) in enumerate(series):
+                item = (name, COLORS[idx % len(COLORS)])
+                if item not in legend_items:
+                    legend_items.append(item)
+        for idx, (name, color) in enumerate(legend_items):
             lx = left + 10 + (idx % 4) * 250
             ly = top + panel_h + 56 + (idx // 4) * 18
-            dash = ' stroke-dasharray="5 4"' if dashed else ""
-            f.write(f'<line x1="{lx:.1f}" y1="{ly - 4:.1f}" x2="{lx + 22:.1f}" y2="{ly - 4:.1f}" stroke="{color}" stroke-width="2.0"{dash}/>\n')
+            f.write(f'<line x1="{lx:.1f}" y1="{ly - 4:.1f}" x2="{lx + 22:.1f}" y2="{ly - 4:.1f}" stroke="{color}" stroke-width="2.2"/>\n')
             text_svg(f, lx + 30, ly, name, anchor="start")
 
-        text_svg(f, left + (width - left - right) / 2, height - 14, "tokens", size=13)
+        text_svg(f, left + (width - left - right) / 2, height - 14, "alpha (%)", size=13)
         text_svg(f, 18, top + panel_h / 2, "time (ms)", size=13, rotate=-90)
         f.write("</svg>\n")
 
@@ -392,6 +393,16 @@ def micro_h(row):
     return None
 
 
+def micro_alpha(row):
+    mode = row["mode"]
+    if mode.startswith("micro_alpha"):
+        try:
+            return int(mode.removeprefix("micro_alpha"))
+        except ValueError:
+            return None
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", required=True, help="Path to summary.csv")
@@ -419,24 +430,34 @@ def main():
         plot_ratio_panels(out_dir / "figure2_attention_expert_copy_ratio.svg", ratio)
 
     panels = []
-    for phase in ["prefill", "decode"]:
-        series = []
-        hs = sorted({
-            h
-            for h in (micro_h(r) for r in rows)
-            if h is not None
-        })
-        for h in hs:
-            for kind, label in [("moe_group_gemm", f"group h={h}"), ("moe_serial_gemm", f"serial h={h}")]:
-                pts = [
-                    (r["x"], r["avg"] / 1000.0)
-                    for r in rows
-                    if r["kind"] == kind and micro_h(r) == h and r["phase"] == phase and r["metric"] == "time_us"
-                ]
-                if pts:
-                    series.append((label, pts))
-        if series:
-            panels.append((phase, series))
+    prefill_tokens = sorted({
+        r["x"]
+        for r in rows
+        if r["kind"] == "moe_gemm" and micro_alpha(r) is not None and r["phase"] == "prefill" and r["metric"] == "time_us"
+    })
+    prefill_series = []
+    for tokens in prefill_tokens:
+        pts = [
+            (micro_alpha(r), r["avg"] / 1000.0)
+            for r in rows
+            if r["kind"] == "moe_gemm"
+            and micro_alpha(r) is not None
+            and r["phase"] == "prefill"
+            and r["metric"] == "time_us"
+            and r["x"] == tokens
+        ]
+        if pts:
+            prefill_series.append((fmt_x(tokens), pts))
+    if prefill_series:
+        panels.append(("prefill", prefill_series))
+
+    decode_pts = [
+        (micro_alpha(r), r["avg"] / 1000.0)
+        for r in rows
+        if r["kind"] == "moe_gemm" and micro_alpha(r) is not None and r["phase"] == "decode" and r["metric"] == "time_us"
+    ]
+    if decode_pts:
+        panels.append(("decode", [("decode", decode_pts)]))
     plot_moe_gemm(out_dir / "figure3_moe_gemm.svg", panels)
 
 
