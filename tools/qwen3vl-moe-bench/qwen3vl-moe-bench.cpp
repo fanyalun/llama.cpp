@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <climits>
 #include <clocale>
 #include <cinttypes>
 #include <cstdio>
@@ -32,6 +33,7 @@ struct bench_params {
     std::string attention_backend = "gpu";
     std::string attention_placement = "kv_gpu_attn_gpu";
     std::string out_dir = "qwen3vl_moe_bench_results";
+    std::string prompt_json;
     std::vector<int32_t> lengths = { 1024, 4096, 8192, 16384 };
     std::vector<int32_t> micro_tokens = { 1024, 2048, 4096, 8192, 16384, 32768 };
     std::vector<int32_t> micro_experts_sweep = { 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -49,6 +51,8 @@ struct bench_params {
     int32_t micro_d_ff = 4096;
     int32_t micro_prefill_tokens = 512;
     int32_t micro_decode_tokens = 1;
+    int32_t route_layer = 10;
+    int32_t route_max_prompts = 16;
     size_t expert_bytes = 0;
 };
 
@@ -89,19 +93,32 @@ struct micro_record {
     int32_t group_experts = 0;
     int32_t serial_experts = 0;
     int32_t active_experts = 0;
+    int32_t sample = -1;
     int32_t repeat = 0;
     int64_t time_us = 0;
     uint64_t bytes = 0;
 };
 
+struct route_record {
+    int32_t seq_len = 0;
+    int32_t sample = 0;
+    int32_t original_tokens = 0;
+    int32_t layer = -1;
+    std::vector<int64_t> expert_counts;
+};
+
 struct callback_data {
     bool profile_all_nodes = true;
+    bool collect_routes = false;
     std::string mode;
     std::string phase;
     int32_t seq_len = 0;
     int32_t repeat = 0;
+    int32_t route_layer = -1;
     int64_t t_start_us = 0;
     std::vector<node_record> * records = nullptr;
+    std::vector<int64_t> * route_counts = nullptr;
+    std::vector<uint8_t> route_data;
 };
 
 static std::string json_escape(const std::string & s) {
@@ -191,6 +208,9 @@ static void print_usage(const char * argv0) {
     LOG("                                                    default: kv_gpu_attn_gpu\n");
     LOG("  --attention-backend <cpu|gpu>                     compatibility alias for kv_cpu_attn_cpu / kv_gpu_attn_gpu\n");
     LOG("  --out-dir <dir>                                  default: qwen3vl_moe_bench_results\n");
+    LOG("  --prompt-json <path>                             collect real layer routes from AIME/OpenAI allresults JSON\n");
+    LOG("  --route-layer <n>                                0-based layer id for token2expert collection; default: 10\n");
+    LOG("  --route-max-prompts <n>                          max prompts per length for route collection; 0 means all; default: 16\n");
     LOG("  --lengths <csv>                                  default: 1024,4096,8192,16384\n");
     LOG("  --micro-tokens <csv>                             default: 1024,2048,4096,8192,16384,32768\n");
     LOG("  --micro-alpha-pcts <csv>                         default: 0,25,50,75,100\n");
@@ -245,6 +265,12 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.attention_placement = need_value("--attention-placement");
             } else if (arg == "--out-dir") {
                 bench.out_dir = need_value("--out-dir");
+            } else if (arg == "--prompt-json") {
+                bench.prompt_json = need_value("--prompt-json");
+            } else if (arg == "--route-layer") {
+                bench.route_layer = std::stoi(need_value("--route-layer"));
+            } else if (arg == "--route-max-prompts") {
+                bench.route_max_prompts = std::stoi(need_value("--route-max-prompts"));
             } else if (arg == "--lengths") {
                 bench.lengths = parse_i32_list(need_value("--lengths"));
             } else if (arg == "--micro-tokens") {
@@ -294,7 +320,8 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
         }
     }
 
-    if (bench.lengths.empty() || bench.micro_tokens.empty() || bench.micro_alpha_pcts.empty() || bench.repeats <= 0 || bench.decode_tokens < 0) {
+    if (bench.lengths.empty() || bench.micro_tokens.empty() || bench.micro_alpha_pcts.empty() || bench.repeats <= 0 || bench.decode_tokens < 0 ||
+            bench.route_layer < 0 || bench.route_max_prompts < 0) {
         LOG_ERR("%s: invalid benchmark dimensions\n", __func__);
         return false;
     }
@@ -376,15 +403,24 @@ static bool is_moe_node(const std::string & base) {
     return base.rfind("ffn_moe_", 0) == 0;
 }
 
+static bool is_route_node(const std::string & base) {
+    return base == "ffn_moe_topk";
+}
+
 static bool eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     auto * cb = (callback_data *) user_data;
     std::string base;
     int32_t layer = -1;
     parse_layer_name(t->name, base, layer);
     const bool interesting = layer >= 0 && (is_attention_node(base) || is_moe_node(base));
+    const bool route_target = cb->collect_routes &&
+                              cb->phase == "prefill" &&
+                              cb->route_counts != nullptr &&
+                              layer == cb->route_layer &&
+                              is_route_node(base);
 
     if (ask) {
-        if (cb->profile_all_nodes || interesting) {
+        if (route_target || cb->profile_all_nodes || interesting) {
             cb->t_start_us = ggml_time_us();
             return true;
         }
@@ -401,6 +437,29 @@ static bool eval_callback(ggml_tensor * t, bool ask, void * user_data) {
         rec.layer = layer;
         rec.time_us = ggml_time_us() - cb->t_start_us;
         cb->records->push_back(std::move(rec));
+    }
+
+    if (route_target && t->type == GGML_TYPE_I32) {
+        const size_t n_bytes = ggml_nbytes(t);
+        const int32_t * ids = nullptr;
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            ids = (const int32_t *) t->data;
+        } else {
+            cb->route_data.resize(n_bytes);
+            ggml_backend_tensor_get(t, cb->route_data.data(), 0, n_bytes);
+            ids = (const int32_t *) cb->route_data.data();
+        }
+
+        const size_t n_ids = n_bytes / sizeof(int32_t);
+        for (size_t i = 0; i < n_ids; ++i) {
+            const int32_t expert = ids[i];
+            if (expert >= 0) {
+                if ((size_t) expert >= cb->route_counts->size()) {
+                    cb->route_counts->resize((size_t) expert + 1, 0);
+                }
+                (*cb->route_counts)[(size_t) expert]++;
+            }
+        }
     }
 
     return true;
@@ -549,6 +608,86 @@ static std::vector<llama_token> make_tokens(const llama_vocab * vocab, int32_t n
         tokens[i] = 1 + (i % (n_vocab - 1));
     }
     return tokens;
+}
+
+static std::string json_string_unescape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\\' || i + 1 >= s.size()) {
+            out.push_back(s[i]);
+            continue;
+        }
+        const char c = s[++i];
+        switch (c) {
+            case 'n':  out.push_back('\n'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 't':  out.push_back('\t'); break;
+            case '"':  out.push_back('"');  break;
+            case '\\': out.push_back('\\'); break;
+            case '/':  out.push_back('/');  break;
+            default:
+                out.push_back('\\');
+                out.push_back(c);
+                break;
+        }
+    }
+    return out;
+}
+
+static void replace_all(std::string & s, const std::string & from, const std::string & to) {
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+static std::string html_unescape_minimal(std::string s) {
+    replace_all(s, "&gt;", ">");
+    replace_all(s, "&lt;", "<");
+    replace_all(s, "&amp;", "&");
+    replace_all(s, "&quot;", "\"");
+    replace_all(s, "&#39;", "'");
+    return s;
+}
+
+static std::vector<std::string> load_aime_prompt_json(const std::string & path) {
+    std::ifstream in(path);
+    if (!in) {
+        LOG_ERR("%s: failed to open prompt JSON '%s'\n", __func__, path.c_str());
+        return {};
+    }
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<std::string> prompts;
+
+    size_t pos = 0;
+    while ((pos = text.find("<h3>Prompt conversation</h3>", pos)) != std::string::npos) {
+        const size_t pre0 = text.find("<pre>", pos);
+        if (pre0 == std::string::npos) {
+            break;
+        }
+        const size_t content0 = pre0 + std::strlen("<pre>");
+        const size_t pre1 = text.find("</pre>", content0);
+        if (pre1 == std::string::npos) {
+            break;
+        }
+
+        std::string prompt = html_unescape_minimal(json_string_unescape(text.substr(content0, pre1 - content0)));
+        while (!prompt.empty() && std::isspace((unsigned char) prompt.front())) {
+            prompt.erase(prompt.begin());
+        }
+        while (!prompt.empty() && std::isspace((unsigned char) prompt.back())) {
+            prompt.pop_back();
+        }
+        if (!prompt.empty()) {
+            prompts.push_back(std::move(prompt));
+        }
+        pos = pre1 + std::strlen("</pre>");
+    }
+
+    LOG_INF("%s: loaded %zu prompt(s) from %s\n", __func__, prompts.size(), path.c_str());
+    return prompts;
 }
 
 static bool decode_range(llama_context * ctx, llama_batch & batch, const std::vector<llama_token> & tokens, int32_t pos0, int32_t n_tokens, bool logits_last) {
@@ -752,6 +891,122 @@ static bool run_model_bench(
     return true;
 }
 
+static bool collect_real_route_distributions(
+        const bench_params & bench,
+        common_params params,
+        const std::string & attention_placement,
+        std::vector<route_record> & routes,
+        model_info & info) {
+    if (bench.prompt_json.empty()) {
+        return true;
+    }
+
+    const std::vector<std::string> prompts = load_aime_prompt_json(bench.prompt_json);
+    if (prompts.empty()) {
+        LOG_ERR("%s: no prompts found in %s\n", __func__, bench.prompt_json.c_str());
+        return false;
+    }
+
+    llama_model_params model_params = common_model_params_to_llama(params);
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+    if (model == nullptr) {
+        LOG_ERR("%s: failed to load model for route collection\n", __func__);
+        return false;
+    }
+
+    const std::string arch = meta_str(model, "general.architecture", "");
+    info.n_layer  = llama_model_n_layer(model);
+    info.n_embd   = llama_model_n_embd(model);
+    info.n_expert = (int32_t) meta_i64(model, arch + ".expert_count", info.n_expert);
+    info.n_ff_exp = (int32_t) meta_i64(model, arch + ".expert_feed_forward_length", info.n_ff_exp);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<std::vector<llama_token>> tokenized;
+    tokenized.reserve(prompts.size());
+    for (const std::string & prompt : prompts) {
+        tokenized.push_back(common_tokenize(vocab, prompt, true, true));
+    }
+
+    callback_data cb;
+    cb.profile_all_nodes = false;
+    cb.collect_routes = true;
+    cb.mode = "real_route";
+    cb.phase = "prefill";
+    cb.route_layer = bench.route_layer;
+
+    params.cb_eval = eval_callback;
+    params.cb_eval_user_data = &cb;
+
+    llama_context_params ctx_params = common_context_params_to_llama(params);
+    ctx_params.offload_attn = placement_attn_gpu(attention_placement) ? 1 : 0;
+    ctx_params.n_seq_max = 1;
+
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    if (ctx == nullptr) {
+        LOG_ERR("%s: failed to create context for route collection\n", __func__);
+        llama_model_free(model);
+        return false;
+    }
+
+    auto * mem = llama_get_memory(ctx);
+    llama_batch batch = llama_batch_init((int32_t) std::max<uint32_t>(1, llama_n_batch(ctx)), 0, 1);
+
+    for (const int32_t seq_len : bench.micro_tokens) {
+        if (seq_len > (int32_t) llama_n_ctx(ctx)) {
+            LOG_WRN("%s: skipping route seq_len=%d because n_ctx=%u\n", __func__, seq_len, llama_n_ctx(ctx));
+            continue;
+        }
+
+        int32_t collected = 0;
+        for (size_t sample = 0; sample < tokenized.size(); ++sample) {
+            if (bench.route_max_prompts > 0 && collected >= bench.route_max_prompts) {
+                break;
+            }
+            const auto & toks = tokenized[sample];
+            if ((int32_t) toks.size() < seq_len) {
+                continue;
+            }
+
+            std::vector<llama_token> clipped(toks.begin(), toks.begin() + seq_len);
+            std::vector<int64_t> counts((size_t) std::max(0, info.n_expert), 0);
+            cb.seq_len = seq_len;
+            cb.repeat = (int32_t) sample;
+            cb.route_counts = &counts;
+
+            llama_memory_clear(mem, false);
+            LOG_INF("route: seq_len=%d sample=%zu layer=%d start\n", seq_len, sample, bench.route_layer);
+            if (!decode_range(ctx, batch, clipped, 0, seq_len, false)) {
+                LOG_ERR("%s: route collection failed for seq_len=%d sample=%zu\n", __func__, seq_len, sample);
+                llama_batch_free(batch);
+                llama_free(ctx);
+                llama_model_free(model);
+                return false;
+            }
+
+            routes.push_back({
+                seq_len,
+                (int32_t) sample,
+                (int32_t) toks.size(),
+                bench.route_layer,
+                std::move(counts),
+            });
+            collected++;
+            LOG_INF("route: seq_len=%d sample=%zu layer=%d done\n", seq_len, sample, bench.route_layer);
+        }
+
+        if (collected == 0) {
+            LOG_WRN("%s: no prompt in %s has enough tokens for seq_len=%d\n", __func__, bench.prompt_json.c_str(), seq_len);
+        }
+    }
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+
+    LOG_INF("%s: collected %zu route distribution(s)\n", __func__, routes.size());
+    return true;
+}
+
 static int64_t gguf_i64_or(const gguf_context * ctx, const std::string & key, int64_t fallback) {
     const int64_t id = gguf_find_key(ctx, key.c_str());
     if (id < 0) {
@@ -915,7 +1170,7 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
         time_us += copy_one_expert(gate_dst, gate_src, 0);
         time_us += copy_one_expert(up_dst,   up_src,   0);
         time_us += copy_one_expert(down_dst, down_src, 0);
-        out.push_back({ "expert_h2d_pinned", "copy", 0, 0, 1, -1, 0, 0, 1, rep, (int64_t) time_us, full_expert_bytes() });
+        out.push_back({ "expert_h2d_pinned", "copy", 0, 0, 1, -1, 0, 0, 1, -1, rep, (int64_t) time_us, full_expert_bytes() });
     }
 
     ggml_backend_buffer_free(gpu_buf);
@@ -1187,6 +1442,7 @@ static bool run_one_gemm_micro(
             group ? experts : 0,
             group ? 0 : experts,
             experts,
+            -1,
             rep,
             t1 - t0,
             0,
@@ -1203,6 +1459,7 @@ static bool run_one_alpha_gemm_micro(
         const std::string & phase,
         int32_t label_tokens,
         int32_t alpha_pct,
+        int32_t sample,
         const std::vector<int32_t> & token_counts,
         const bench_params & bench,
         const model_info & info,
@@ -1264,6 +1521,7 @@ static bool run_one_alpha_gemm_micro(
             group_experts,
             serial_experts,
             active_experts,
+            sample,
             rep,
             t1 - t0,
             0,
@@ -1275,7 +1533,20 @@ static bool run_one_alpha_gemm_micro(
     return true;
 }
 
-static bool run_gemm_microbench(const bench_params & bench, const model_info & info, std::vector<micro_record> & out) {
+static std::vector<int32_t> route_counts_i32(const route_record & route) {
+    std::vector<int32_t> counts;
+    counts.reserve(route.expert_counts.size());
+    for (const int64_t count : route.expert_counts) {
+        counts.push_back((int32_t) std::min<int64_t>(count, INT32_MAX));
+    }
+    return counts;
+}
+
+static bool run_gemm_microbench(
+        const bench_params & bench,
+        const model_info & info,
+        const std::vector<route_record> & routes,
+        std::vector<micro_record> & out) {
     ggml_backend_dev_t dev = first_gpu_device();
     if (dev == nullptr) {
         LOG_WRN("%s: no GPU/ACCEL backend found; skipping GEMM microbench\n", __func__);
@@ -1291,22 +1562,39 @@ static bool run_gemm_microbench(const bench_params & bench, const model_info & i
     const int32_t prefill_experts = info.n_expert > 0 ? info.n_expert : bench.micro_experts;
     const int32_t decode_experts = 8;
     for (const int32_t alpha_pct : bench.micro_alpha_pcts) {
-        for (const int32_t tokens : bench.micro_tokens) {
-            run_one_alpha_gemm_micro(
-                    backend,
-                    "prefill",
-                    tokens,
-                    alpha_pct,
-                    make_prefill_token_counts(tokens, prefill_experts),
-                    bench,
-                    info,
-                    out);
+        if (!routes.empty()) {
+            for (const route_record & route : routes) {
+                run_one_alpha_gemm_micro(
+                        backend,
+                        "prefill",
+                        route.seq_len,
+                        alpha_pct,
+                        route.sample,
+                        route_counts_i32(route),
+                        bench,
+                        info,
+                        out);
+            }
+        } else {
+            for (const int32_t tokens : bench.micro_tokens) {
+                run_one_alpha_gemm_micro(
+                        backend,
+                        "prefill",
+                        tokens,
+                        alpha_pct,
+                        -1,
+                        make_prefill_token_counts(tokens, prefill_experts),
+                        bench,
+                        info,
+                        out);
+            }
         }
         run_one_alpha_gemm_micro(
                 backend,
                 "decode",
                 bench.micro_decode_tokens,
                 alpha_pct,
+                -1,
                 make_decode_token_counts(decode_experts),
                 bench,
                 info,
@@ -1321,6 +1609,7 @@ static void write_raw_jsonl(
         const std::filesystem::path & path,
         const std::vector<node_record> & nodes,
         const std::vector<copy_record> & copies,
+        const std::vector<route_record> & routes,
         const std::vector<micro_record> & micros) {
     std::ofstream jsonl(path);
     for (const auto & rec : nodes) {
@@ -1336,6 +1625,22 @@ static void write_raw_jsonl(
     }
     append_attention_summary(nodes, jsonl);
     write_copy_jsonl(copies, jsonl);
+    for (const auto & rec : routes) {
+        jsonl << "{\"kind\":\"moe_route_distribution\""
+              << ",\"phase\":\"prefill\""
+              << ",\"seq_len\":" << rec.seq_len
+              << ",\"sample\":" << rec.sample
+              << ",\"original_tokens\":" << rec.original_tokens
+              << ",\"layer\":" << rec.layer
+              << ",\"expert_counts\":[";
+        for (size_t i = 0; i < rec.expert_counts.size(); ++i) {
+            if (i) {
+                jsonl << ",";
+            }
+            jsonl << rec.expert_counts[i];
+        }
+        jsonl << "]}\n";
+    }
     for (const auto & rec : micros) {
         jsonl << "{\"kind\":\"" << json_escape(rec.kind) << "\""
               << ",\"phase\":\"" << json_escape(rec.phase) << "\""
@@ -1346,6 +1651,7 @@ static void write_raw_jsonl(
               << ",\"group_experts\":" << rec.group_experts
               << ",\"serial_experts\":" << rec.serial_experts
               << ",\"active_experts\":" << rec.active_experts
+              << ",\"sample\":" << rec.sample
               << ",\"repeat\":" << rec.repeat
               << ",\"time_us\":" << rec.time_us
               << ",\"bytes\":" << rec.bytes
@@ -1450,6 +1756,9 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- mode: `" << bench.mode << "`\n";
     report << "- attention_placement: `" << bench.attention_placement << "`\n";
     report << "- attention_backend_compat: `" << bench.attention_backend << "`\n";
+    report << "- prompt_json: `" << (bench.prompt_json.empty() ? "-" : bench.prompt_json) << "`\n";
+    report << "- route_layer: `" << bench.route_layer << "`\n";
+    report << "- route_max_prompts: `" << bench.route_max_prompts << "`\n";
     report << "- repeats: `" << bench.repeats << "`\n";
     report << "- decode_tokens: `" << bench.decode_tokens << "`\n";
     report << "- skip_microbench: `" << (bench.skip_microbench ? 1 : 0) << "`\n";
@@ -1516,7 +1825,10 @@ int main(int argc, char ** argv) {
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
-    const int32_t max_len = *std::max_element(bench.lengths.begin(), bench.lengths.end());
+    int32_t max_len = *std::max_element(bench.lengths.begin(), bench.lengths.end());
+    if (!bench.prompt_json.empty() && !bench.micro_tokens.empty()) {
+        max_len = std::max(max_len, *std::max_element(bench.micro_tokens.begin(), bench.micro_tokens.end()));
+    }
     const int32_t n_ctx_req = max_len + bench.decode_tokens;
     if (params.n_ctx < n_ctx_req) {
         params.n_ctx = n_ctx_req;
@@ -1531,6 +1843,7 @@ int main(int argc, char ** argv) {
 
     std::vector<node_record> node_records;
     std::vector<copy_record> copy_records;
+    std::vector<route_record> route_records;
     std::vector<micro_record> micro_records;
     model_info info;
     bool ok = true;
@@ -1559,14 +1872,20 @@ int main(int argc, char ** argv) {
         if ((info.n_embd <= 0 || info.n_ff_exp <= 0) && !params.model.path.empty()) {
             ok = load_model_info_metadata(params, info) && ok;
         }
+        if (!bench.prompt_json.empty()) {
+            std::vector<std::string> owned_patterns;
+            const std::string placement = attention_placements_to_run(bench).front();
+            common_params route_params = make_run_params(params, bench, bench.mode, placement, bench.n_cpu_moe_layers, owned_patterns);
+            ok = collect_real_route_distributions(bench, route_params, placement, route_records, info) && ok;
+        }
         ok = run_h2d_microbench(bench, info, micro_records) && ok;
         if (!bench.skip_gemm_microbench) {
-            ok = run_gemm_microbench(bench, info, micro_records) && ok;
+            ok = run_gemm_microbench(bench, info, route_records, micro_records) && ok;
         }
     }
 
     const std::filesystem::path out_dir = bench.out_dir;
-    write_raw_jsonl(out_dir / "results.jsonl", node_records, copy_records, micro_records);
+    write_raw_jsonl(out_dir / "results.jsonl", node_records, copy_records, route_records, micro_records);
     write_summary_csv(out_dir / "summary.csv", node_records, copy_records, micro_records, bench.decode_tokens);
     write_report(out_dir / "report.md", bench, info, argc, argv);
 

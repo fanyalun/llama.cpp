@@ -99,6 +99,31 @@ Measure the Alpha MoE GEMM sweep without rerunning the model benchmark:
   --out-dir results/qwen3vl_moe_gemm
 ```
 
+Measure the Alpha MoE GEMM sweep with real layer-10 token-to-expert routing
+from the AIME allresults JSON:
+
+```sh
+./build/bin/llama-qwen3vl-moe-bench \
+  -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
+  --skip-model-bench \
+  --skip-gemm-microbench 0 \
+  --prompt-json benches/dgx-spark/aime25_openai__gpt-oss-120b-high_temp1.0_20251109_094547_allresults.json \
+  --route-layer 10 \
+  --route-max-prompts 16 \
+  --micro-tokens 1024,2048,4096,8192,16384,32768 \
+  --micro-alpha-pcts 0,25,50,75,100 \
+  --repeats 3 \
+  -ngl auto \
+  --out-dir results/qwen3vl_moe_gemm_real
+```
+
+`--prompt-json` changes the prefill GEMM sweep from synthetic long-tail routing
+to real `ffn_moe_topk` routing collected at `--route-layer`. The prompt text is
+read from each JSON HTML entry's `Prompt conversation` block, tokenized by the
+loaded model, and clipped to each `--micro-tokens` length. Prompts shorter than a
+target length are skipped. Use `--route-max-prompts 0` to collect all eligible
+prompts for each length.
+
 The Alpha sweep splits active experts by expert id order. The first
 `floor(active_experts * alpha / 100)` experts use Group GEMM, and the remaining
 experts use Serial GEMM. Prefill uses the model expert count as active experts
@@ -118,7 +143,7 @@ python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
 
 Outputs:
 
-- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, and microbench records. Alpha GEMM records include `alpha_pct`, `group_experts`, `serial_experts`, and `active_experts`.
+- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, route distributions, and microbench records. Alpha GEMM records include `alpha_pct`, `group_experts`, `serial_experts`, and `active_experts`.
 - `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Alpha GEMM rows use `mode=micro_alphaN`.
 - `plots/figure1_attention_time.svg`: prefill/decode average per-layer Attention time.
 - `plots/figure2_attention_expert_copy_ratio.svg`: `KV CPU + Attn CPU` average per-layer Attention time divided by one routed expert pinned H2D copy time.
