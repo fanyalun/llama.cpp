@@ -110,12 +110,27 @@ extern "C" {
         uint64_t time_us;
     };
 
+    struct ggml_backend_kv_copy_record {
+        int32_t layer;
+        uint64_t calls;
+        uint64_t bytes;
+        uint64_t time_us;
+    };
+
     // Optional profiling for MoE expert copies performed by the backend scheduler.
     // Disabled by default because it synchronizes the destination backend around
     // the measured copies.
     GGML_API void ggml_backend_moe_copy_stats_set_enabled(bool enabled);
     GGML_API void ggml_backend_moe_copy_stats_reset(void);
     GGML_API struct ggml_backend_moe_copy_stats ggml_backend_moe_copy_stats_get(void);
+
+    // Optional profiling for CPU KV cache copies into GPU/accelerator attention splits.
+    // Disabled by default because it synchronizes the destination backend around
+    // the measured copies.
+    GGML_API void   ggml_backend_kv_copy_stats_set_enabled(bool enabled);
+    GGML_API void   ggml_backend_kv_copy_stats_reset(void);
+    GGML_API size_t ggml_backend_kv_copy_stats_count(void);
+    GGML_API bool   ggml_backend_kv_copy_stats_get(size_t index, struct ggml_backend_kv_copy_record * record);
 
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);

@@ -16,18 +16,26 @@ Recommended run:
 ./build/bin/llama-qwen3vl-moe-bench \
   -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
   --mode moe_cpu_offload \
-  --attention-backend gpu \
+  --attention-placement all \
   -ngl auto \
   --flash-attn on \
-  --lengths 8192,16384,32768,65536,131072 \
+  --lengths 1024,4096,8192,16384 \
   --decode-tokens 16 \
-  --repeats 5 \
-  --out-dir results/qwen3vl_moe_bench
+  --repeats 3 \
+  --skip-microbench \
+  --out-dir results/qwen3vl_attn_placement
 ```
 
-This keeps routed expert weights on CPU through MoE offload while placing KV
-cache and Attention on GPU. FlashAttention uses the llama.cpp/ggml backend
-implementation; no external Python `flash-attn` package is required.
+`--attention-placement all` runs:
+
+- `kv_gpu_attn_gpu`: KV cache and Attention on GPU.
+- `kv_cpu_attn_cpu`: KV cache and Attention on CPU.
+- `kv_cpu_attn_gpu`: KV cache stored on CPU, copied temporarily to GPU for Attention.
+
+For `kv_cpu_attn_gpu`, per-layer Attention time includes CPU KV cache to GPU
+copy time plus GPU Attention compute time. FlashAttention uses the
+llama.cpp/ggml backend implementation; no external Python `flash-attn` package
+is required.
 
 Smoke test:
 
@@ -35,12 +43,13 @@ Smoke test:
 ./build/bin/llama-qwen3vl-moe-bench \
   -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
   --mode moe_cpu_offload \
-  --attention-backend gpu \
+  --attention-placement all \
   -ngl auto \
   --flash-attn on \
-  --lengths 8192 \
+  --lengths 1024 \
   --decode-tokens 1 \
   --repeats 1 \
+  --skip-microbench \
   --out-dir results/qwen3vl_moe_bench_smoke
 ```
 
@@ -50,7 +59,7 @@ CPU-only fallback:
 ./build/bin/llama-qwen3vl-moe-bench \
   -m /path/to/model.gguf \
   --mode cpu_full \
-  --lengths 8192,16384,32768,65536,131072 \
+  --lengths 1024,4096,8192,16384 \
   --decode-tokens 16 \
   --out-dir results/qwen3vl_moe_bench_cpu
 ```
@@ -65,8 +74,8 @@ python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
 
 Outputs:
 
-- `results.jsonl`: raw node timings, per-layer attention summaries, runtime MoE copy records, pinned H2D copy records, and microbench records.
-- `summary.csv`: aggregated averages and standard deviations. Microbench rows use `mode=micro_hN` for the active expert-count sweep.
+- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, pinned H2D copy records, and microbench records.
+- `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Microbench rows use `mode=micro_hN` for the active expert-count sweep.
 - `plots/figure1_attention_time.svg`: prefill/decode average per-layer Attention time.
 - `plots/figure2_attention_copy_ratio.svg`: average per-layer Attention time divided by one routed expert pinned H2D copy time.
 - `plots/figure3_moe_gemm.svg`: Serial vs Group GEMM full expert FFN sweep for `h=1..8`.

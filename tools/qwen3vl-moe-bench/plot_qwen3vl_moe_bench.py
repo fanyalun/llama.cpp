@@ -173,10 +173,16 @@ def plot_moe_gemm(path, panels):
                 path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
                 f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.0"{dash}/>\n')
 
+        hs = sorted({
+            int(name.rsplit("=", 1)[1])
+            for _, series in panels
+            for name, _ in series
+            if "=" in name
+        })
         legend_items = []
-        for h in range(1, 9):
+        for h in hs:
             legend_items.append((f"group h={h}", COLORS[(h - 1) % len(COLORS)], False))
-        for h in range(1, 9):
+        for h in hs:
             legend_items.append((f"serial h={h}", COLORS[(h - 1) % len(COLORS)], True))
         for idx, (name, color, dashed) in enumerate(legend_items):
             lx = left + 10 + (idx % 4) * 250
@@ -194,8 +200,27 @@ def average_attention(rows):
     grouped = defaultdict(list)
     for r in rows:
         if r["kind"] == "attention_layer" and r["metric"] == "time_us":
-            grouped[(r["phase"], r["x"])].append(r["avg"] / 1000.0)
+            grouped[(r["mode"], r["phase"], r["x"])].append(r["avg"] / 1000.0)
     return {k: sum(v) / len(v) for k, v in grouped.items() if v}
+
+
+def attention_label(mode, phase):
+    prefix = "moe_cpu_offload_"
+    if mode.startswith(prefix):
+        mode = mode[len(prefix):]
+    return f"{mode} {phase}"
+
+
+def micro_h(row):
+    mode = row["mode"]
+    if mode == "micro":
+        return 1
+    if mode.startswith("micro_h"):
+        try:
+            return int(mode.removeprefix("micro_h"))
+        except ValueError:
+            return None
+    return None
 
 
 def main():
@@ -210,32 +235,38 @@ def main():
 
     attn = average_attention(rows)
     attention_series = []
-    for phase in ["prefill", "decode"]:
-        pts = sorted((x, y) for (p, x), y in attn.items() if p == phase)
-        if pts:
-            attention_series.append((phase, pts))
+    for mode in sorted({m for (m, _, _) in attn}):
+        for phase in ["prefill", "decode"]:
+            pts = sorted((x, y) for (m, p, x), y in attn.items() if m == mode and p == phase)
+            if pts:
+                attention_series.append((attention_label(mode, phase), pts))
     plot_lines(out_dir / "figure1_attention_time.svg", "Attention Time", attention_series, "sequence length", "avg layer time (ms)")
 
     copy_times = [r["avg"] / 1000.0 for r in rows if r["kind"] == "h2d_pinned" and r["metric"] == "time_us"]
     if copy_times:
         copy_time = sum(copy_times) / len(copy_times)
         ratio_series = []
-        for phase in ["prefill", "decode"]:
-            pts = sorted((x, y / copy_time) for (p, x), y in attn.items() if p == phase and copy_time > 0)
-            if pts:
-                ratio_series.append((phase, pts))
+        for mode in sorted({m for (m, _, _) in attn}):
+            for phase in ["prefill", "decode"]:
+                pts = sorted((x, y / copy_time) for (m, p, x), y in attn.items() if m == mode and p == phase and copy_time > 0)
+                if pts:
+                    ratio_series.append((attention_label(mode, phase), pts))
         plot_lines(out_dir / "figure2_attention_copy_ratio.svg", "Attention / H2D Copy", ratio_series, "sequence length", "ratio")
 
     panels = []
     for phase in ["prefill", "decode"]:
         series = []
-        for h in range(1, 9):
-            mode = f"micro_h{h}"
+        hs = sorted({
+            h
+            for h in (micro_h(r) for r in rows)
+            if h is not None
+        })
+        for h in hs:
             for kind, label in [("moe_group_gemm", f"group h={h}"), ("moe_serial_gemm", f"serial h={h}")]:
                 pts = [
                     (r["x"], r["avg"] / 1000.0)
                     for r in rows
-                    if r["kind"] == kind and r["mode"] == mode and r["phase"] == phase and r["metric"] == "time_us"
+                    if r["kind"] == kind and micro_h(r) == h and r["phase"] == phase and r["metric"] == "time_us"
                 ]
                 if pts:
                     series.append((label, pts))

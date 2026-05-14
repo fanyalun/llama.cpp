@@ -21,6 +21,8 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -32,6 +34,9 @@ static std::atomic<bool>     g_moe_copy_stats_enabled{false};
 static std::atomic<uint64_t> g_moe_copy_stats_calls{0};
 static std::atomic<uint64_t> g_moe_copy_stats_bytes{0};
 static std::atomic<uint64_t> g_moe_copy_stats_time_us{0};
+static std::atomic<bool>     g_kv_copy_stats_enabled{false};
+static std::mutex            g_kv_copy_stats_mutex;
+static std::vector<ggml_backend_kv_copy_record> g_kv_copy_stats_records;
 
 void ggml_backend_moe_copy_stats_set_enabled(bool enabled) {
     g_moe_copy_stats_enabled.store(enabled, std::memory_order_relaxed);
@@ -49,6 +54,34 @@ struct ggml_backend_moe_copy_stats ggml_backend_moe_copy_stats_get(void) {
         g_moe_copy_stats_bytes.load(std::memory_order_relaxed),
         g_moe_copy_stats_time_us.load(std::memory_order_relaxed),
     };
+}
+
+void ggml_backend_kv_copy_stats_set_enabled(bool enabled) {
+    g_kv_copy_stats_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+void ggml_backend_kv_copy_stats_reset(void) {
+    std::lock_guard<std::mutex> lock(g_kv_copy_stats_mutex);
+    g_kv_copy_stats_records.clear();
+}
+
+size_t ggml_backend_kv_copy_stats_count(void) {
+    std::lock_guard<std::mutex> lock(g_kv_copy_stats_mutex);
+    return g_kv_copy_stats_records.size();
+}
+
+bool ggml_backend_kv_copy_stats_get(size_t index, struct ggml_backend_kv_copy_record * record) {
+    std::lock_guard<std::mutex> lock(g_kv_copy_stats_mutex);
+    if (record == nullptr || index >= g_kv_copy_stats_records.size()) {
+        return false;
+    }
+    *record = g_kv_copy_stats_records[index];
+    return true;
+}
+
+static void ggml_backend_kv_copy_stats_add(int32_t layer, uint64_t bytes, uint64_t time_us) {
+    std::lock_guard<std::mutex> lock(g_kv_copy_stats_mutex);
+    g_kv_copy_stats_records.push_back({ layer, 1, bytes, time_us });
 }
 
 
@@ -851,6 +884,126 @@ struct ggml_backend_sched {
     int debug_prev_graph_size;
 };
 
+static bool ggml_backend_sched_backend_is_gpu(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return false;
+    }
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+
+static bool ggml_backend_sched_backend_is_cpu(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static bool ggml_backend_sched_parse_dash_layer(const char * name, int32_t * layer, size_t * base_len) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    const char * dash = strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return false;
+    }
+
+    int32_t value = 0;
+    for (const char * p = dash + 1; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        value = value*10 + (*p - '0');
+    }
+
+    if (layer) {
+        *layer = value;
+    }
+    if (base_len) {
+        *base_len = (size_t) (dash - name);
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_name_eq(const char * name, size_t len, const char * expected) {
+    return strlen(expected) == len && strncmp(name, expected, len) == 0;
+}
+
+static bool ggml_backend_sched_name_starts_with(const char * name, size_t len, const char * expected) {
+    const size_t expected_len = strlen(expected);
+    return len >= expected_len && strncmp(name, expected, expected_len) == 0;
+}
+
+static bool ggml_backend_sched_is_attention_node(const char * name, int32_t * layer) {
+    size_t base_len = 0;
+    if (!ggml_backend_sched_parse_dash_layer(name, layer, &base_len)) {
+        return false;
+    }
+
+    return ggml_backend_sched_name_eq(name, base_len, "__fattn__") ||
+           ggml_backend_sched_name_eq(name, base_len, "fattn_mla") ||
+           ggml_backend_sched_name_eq(name, base_len, "v_cont") ||
+           ggml_backend_sched_name_eq(name, base_len, "kq") ||
+           ggml_backend_sched_name_eq(name, base_len, "kqv") ||
+           ggml_backend_sched_name_eq(name, base_len, "kqv_mla") ||
+           ggml_backend_sched_name_eq(name, base_len, "kqv_out") ||
+           ggml_backend_sched_name_eq(name, base_len, "kq_scaled") ||
+           ggml_backend_sched_name_starts_with(name, base_len, "kq_");
+}
+
+static bool ggml_backend_sched_split_has_attention_layer(const struct ggml_backend_sched_split * split, int32_t target_layer) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        int32_t layer = -1;
+        if (ggml_backend_sched_is_attention_node(split->graph.nodes[i]->name, &layer) && layer == target_layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_parse_cache_layer_name(const char * name, int32_t * layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    const char * prefix = nullptr;
+    if (strncmp(name, "cache_k_l", 9) == 0) {
+        prefix = name + 9;
+    } else if (strncmp(name, "cache_v_l", 9) == 0) {
+        prefix = name + 9;
+    } else {
+        return false;
+    }
+
+    if (*prefix == '\0') {
+        return false;
+    }
+
+    int32_t value = 0;
+    for (const char * p = prefix; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        value = value*10 + (*p - '0');
+    }
+
+    if (layer) {
+        *layer = value;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_kv_cache_input_layer(const struct ggml_tensor * input, int32_t * layer) {
+    const struct ggml_tensor * cur = input;
+    while (cur != nullptr) {
+        if (ggml_backend_sched_parse_cache_layer_name(cur->name, layer)) {
+            return true;
+        }
+        cur = cur->view_src;
+    }
+    return false;
+}
+
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
@@ -1574,6 +1727,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool profile_kv_copy_split =
+            g_kv_copy_stats_enabled.load(std::memory_order_relaxed) &&
+            ggml_backend_sched_backend_is_gpu(split_backend);
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1695,6 +1851,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    int32_t kv_layer = -1;
+                    const bool profile_kv_copy =
+                        profile_kv_copy_split &&
+                        ggml_backend_sched_backend_is_cpu(input_backend) &&
+                        ggml_backend_sched_kv_cache_input_layer(input, &kv_layer) &&
+                        ggml_backend_sched_split_has_attention_layer(split, kv_layer);
+                    const int64_t t_start_us = profile_kv_copy ? ggml_time_us() : 0;
+
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1705,6 +1869,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    }
+                    if (profile_kv_copy) {
+                        ggml_backend_synchronize(split_backend);
+                        const int64_t t_end_us = ggml_time_us();
+                        ggml_backend_kv_copy_stats_add(kv_layer, ggml_nbytes(input), (uint64_t) (t_end_us - t_start_us));
                     }
                 }
             }

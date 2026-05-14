@@ -50,6 +50,7 @@ llama_context::llama_context(
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
+    cparams.offload_attn     = params.offload_attn < 0 ? params.offload_kqv : params.offload_attn != 0;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
@@ -2198,12 +2199,33 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+static bool llama_graph_is_attn_node_name(const char * name) {
+    return strcmp(name, LLAMA_TENSOR_NAME_FATTN) == 0 ||
+           strcmp(name, "fattn_mla") == 0 ||
+           strcmp(name, "v_cont") == 0 ||
+           strcmp(name, "kq") == 0 ||
+           strcmp(name, "kqv") == 0 ||
+           strcmp(name, "kqv_mla") == 0 ||
+           strcmp(name, "kqv_out") == 0 ||
+           strcmp(name, "kq_scaled") == 0 ||
+           strncmp(name, "kq_", 3) == 0;
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (cparams.offload_attn && il >= 0 && llama_graph_is_attn_node_name(name)) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer && ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                }
+            }
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3221,6 +3243,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.offload_attn                =*/ -1,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

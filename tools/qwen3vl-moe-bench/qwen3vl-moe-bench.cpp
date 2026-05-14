@@ -28,8 +28,9 @@
 struct bench_params {
     std::string mode = "moe_cpu_offload";
     std::string attention_backend = "gpu";
+    std::string attention_placement = "kv_gpu_attn_gpu";
     std::string out_dir = "qwen3vl_moe_bench_results";
-    std::vector<int32_t> lengths = { 8192, 16384, 32768, 65536, 131072 };
+    std::vector<int32_t> lengths = { 1024, 4096, 8192, 16384 };
     std::vector<int32_t> micro_tokens = { 256, 512, 1024, 2048, 4096 };
     std::vector<int32_t> micro_experts_sweep = { 1, 2, 3, 4, 5, 6, 7, 8 };
     std::vector<int32_t> n_cpu_moe_sweep = { 48, 36, 24, 12, 0 };
@@ -178,9 +179,11 @@ static void print_usage(const char * argv0) {
     LOG("  %s -m model.gguf [common llama.cpp args] [bench args]\n\n", argv0);
     LOG("bench args:\n");
     LOG("  --mode <cpu_full|moe_cpu_offload|moe_cpu_sweep>  default: moe_cpu_offload\n");
-    LOG("  --attention-backend <cpu|gpu>                     default: gpu, controls KV cache and KQV/FAttention placement for MoE offload modes\n");
+    LOG("  --attention-placement <kv_gpu_attn_gpu|kv_cpu_attn_cpu|kv_cpu_attn_gpu|all>\n");
+    LOG("                                                    default: kv_gpu_attn_gpu\n");
+    LOG("  --attention-backend <cpu|gpu>                     compatibility alias for kv_cpu_attn_cpu / kv_gpu_attn_gpu\n");
     LOG("  --out-dir <dir>                                  default: qwen3vl_moe_bench_results\n");
-    LOG("  --lengths <csv>                                  default: 8192,16384,32768,65536,131072\n");
+    LOG("  --lengths <csv>                                  default: 1024,4096,8192,16384\n");
     LOG("  --micro-tokens <csv>                             default: 256,512,1024,2048,4096\n");
     LOG("  --micro-experts-sweep <csv>                      default: 1,2,3,4,5,6,7,8\n");
     LOG("  --decode-tokens <n>                              default: 16\n");
@@ -196,8 +199,8 @@ static void print_usage(const char * argv0) {
     LOG("  --micro-d-ff <n>                                 default: model expert FFN or 4096\n");
     LOG("  --micro-prefill-tokens <n>                       compatibility alias for --micro-tokens <n>\n");
     LOG("  --micro-decode-tokens <n>                        default: 1 active token for decode labels\n\n");
-    LOG("recommended GPU-attention MoE offload run:\n");
-    LOG("  %s -m model.gguf --mode moe_cpu_offload --attention-backend gpu --flash-attn on -ngl auto --lengths 8192,16384 --decode-tokens 16\n\n", argv0);
+    LOG("recommended attention placement run:\n");
+    LOG("  %s -m model.gguf --mode moe_cpu_offload --attention-placement all --flash-attn on -ngl auto --lengths 1024,4096,8192,16384 --decode-tokens 16\n\n", argv0);
 }
 
 static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std::vector<std::string> & common_args) {
@@ -221,6 +224,9 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.mode = need_value("--mode");
             } else if (arg == "--attention-backend") {
                 bench.attention_backend = need_value("--attention-backend");
+                bench.attention_placement = bench.attention_backend == "cpu" ? "kv_cpu_attn_cpu" : "kv_gpu_attn_gpu";
+            } else if (arg == "--attention-placement") {
+                bench.attention_placement = need_value("--attention-placement");
             } else if (arg == "--out-dir") {
                 bench.out_dir = need_value("--out-dir");
             } else if (arg == "--lengths") {
@@ -280,6 +286,13 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
         LOG_ERR("%s: unknown attention backend '%s'\n", __func__, bench.attention_backend.c_str());
         return false;
     }
+    if (bench.attention_placement != "kv_gpu_attn_gpu" &&
+            bench.attention_placement != "kv_cpu_attn_cpu" &&
+            bench.attention_placement != "kv_cpu_attn_gpu" &&
+            bench.attention_placement != "all") {
+        LOG_ERR("%s: unknown attention placement '%s'\n", __func__, bench.attention_placement.c_str());
+        return false;
+    }
     for (const int32_t h : bench.micro_experts_sweep) {
         if (h <= 0) {
             LOG_ERR("%s: invalid micro expert count %d\n", __func__, h);
@@ -323,6 +336,7 @@ static bool parse_layer_name(const char * cname, std::string & base, int32_t & l
 
 static bool is_attention_node(const std::string & base) {
     return base == "__fattn__" ||
+           base == "attention_kv_h2d" ||
            base == "fattn_mla" ||
            base == "v_cont" ||
            base == "kq" ||
@@ -366,6 +380,34 @@ static bool eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
+static uint64_t append_attention_kv_copy_records(
+        const std::string & mode,
+        const std::string & phase,
+        int32_t seq_len,
+        int32_t repeat,
+        std::vector<node_record> & node_records) {
+    uint64_t total_us = 0;
+    const size_t n = ggml_backend_kv_copy_stats_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_kv_copy_record kv = {};
+        if (!ggml_backend_kv_copy_stats_get(i, &kv)) {
+            continue;
+        }
+
+        node_record rec;
+        rec.mode = mode;
+        rec.phase = phase;
+        rec.name = "attention_kv_h2d";
+        rec.seq_len = seq_len;
+        rec.repeat = repeat;
+        rec.layer = kv.layer;
+        rec.time_us = (int64_t) kv.time_us;
+        node_records.push_back(std::move(rec));
+        total_us += kv.time_us;
+    }
+    return total_us;
+}
+
 static void trim_tensor_overrides(std::vector<llama_model_tensor_buft_override> & overrides) {
     while (!overrides.empty() && overrides.back().pattern == nullptr) {
         overrides.pop_back();
@@ -395,7 +437,34 @@ static void apply_cpu_moe_overrides(common_params & params, int32_t n_cpu_moe_la
     terminate_tensor_overrides(params.tensor_buft_overrides);
 }
 
-static common_params make_run_params(const common_params & base, const bench_params & bench, const std::string & mode, int32_t n_cpu_moe_layers, std::vector<std::string> & owned_patterns) {
+static bool placement_kv_gpu(const std::string & placement) {
+    return placement == "kv_gpu_attn_gpu";
+}
+
+static bool placement_attn_gpu(const std::string & placement) {
+    return placement == "kv_gpu_attn_gpu" || placement == "kv_cpu_attn_gpu";
+}
+
+static std::vector<std::string> attention_placements_to_run(const bench_params & bench) {
+    if (bench.mode == "cpu_full") {
+        return { "kv_cpu_attn_cpu" };
+    }
+    if (bench.attention_placement == "all") {
+        return { "kv_gpu_attn_gpu", "kv_cpu_attn_cpu", "kv_cpu_attn_gpu" };
+    }
+    return { bench.attention_placement };
+}
+
+static bool any_placement_attn_gpu(const bench_params & bench) {
+    for (const auto & placement : attention_placements_to_run(bench)) {
+        if (placement_attn_gpu(placement)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static common_params make_run_params(const common_params & base, const bench_params & bench, const std::string & mode, const std::string & attention_placement, int32_t n_cpu_moe_layers, std::vector<std::string> & owned_patterns) {
     common_params params = base;
 
     if (mode == "cpu_full") {
@@ -408,7 +477,7 @@ static common_params make_run_params(const common_params & base, const bench_par
     }
 
     if (mode == "moe_cpu_offload" || mode == "moe_cpu_sweep") {
-        params.no_kv_offload = bench.attention_backend == "cpu";
+        params.no_kv_offload = !placement_kv_gpu(attention_placement);
         apply_cpu_moe_overrides(params, n_cpu_moe_layers, owned_patterns);
         return params;
     }
@@ -417,12 +486,12 @@ static common_params make_run_params(const common_params & base, const bench_par
     return params;
 }
 
-static std::string make_mode_label(const bench_params & bench, const std::string & mode, int32_t n_cpu_moe_layers) {
+static std::string make_mode_label(const std::string & attention_placement, const std::string & mode, int32_t n_cpu_moe_layers) {
     if (mode == "moe_cpu_sweep") {
-        return "moe_cpu_sweep_n" + std::to_string(n_cpu_moe_layers) + "_attn_" + bench.attention_backend;
+        return "moe_cpu_sweep_n" + std::to_string(n_cpu_moe_layers) + "_" + attention_placement;
     }
     if (mode == "moe_cpu_offload") {
-        return "moe_cpu_offload_attn_" + bench.attention_backend;
+        return "moe_cpu_offload_" + attention_placement;
     }
     return mode;
 }
@@ -538,6 +607,7 @@ static bool run_model_bench(
         const bench_params & bench,
         common_params params,
         const std::string & mode_label,
+        const std::string & attention_placement,
         std::vector<node_record> & node_records,
         std::vector<copy_record> & copy_records,
         model_info & info) {
@@ -563,6 +633,7 @@ static bool run_model_bench(
     params.cb_eval_user_data = &cb;
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
+    ctx_params.offload_attn = placement_attn_gpu(attention_placement) ? 1 : 0;
     ctx_params.n_seq_max = 1;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
@@ -581,6 +652,7 @@ static bool run_model_bench(
     llama_batch batch = llama_batch_init((int32_t) std::max<uint32_t>(1, llama_n_batch(ctx)), 0, 1);
 
     ggml_backend_moe_copy_stats_set_enabled(true);
+    ggml_backend_kv_copy_stats_set_enabled(attention_placement == "kv_cpu_attn_gpu");
 
     for (int32_t seq_len : bench.lengths) {
         if (seq_len + bench.decode_tokens > (int32_t) llama_n_ctx(ctx)) {
@@ -595,6 +667,7 @@ static bool run_model_bench(
             cb.seq_len = seq_len;
             cb.repeat = rep;
             ggml_backend_moe_copy_stats_reset();
+            ggml_backend_kv_copy_stats_reset();
             LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=prefill start\n",
                     mode_label.c_str(), seq_len, rep + 1, bench.repeats);
             const int64_t t_prefill_start = ggml_time_us();
@@ -607,16 +680,19 @@ static bool run_model_bench(
             }
             const int64_t t_prefill_end = ggml_time_us();
             auto st_prefill = ggml_backend_moe_copy_stats_get();
+            const uint64_t kv_prefill_us = append_attention_kv_copy_records(mode_label, "prefill", seq_len, rep, node_records);
             copy_records.push_back({ mode_label, "prefill", seq_len, rep, st_prefill.calls, st_prefill.bytes, st_prefill.time_us });
-            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=prefill done total_ms=%.3f moe_copy_ms=%.3f\n",
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=prefill done total_ms=%.3f moe_copy_ms=%.3f kv_h2d_ms=%.3f\n",
                     mode_label.c_str(), seq_len, rep + 1, bench.repeats,
                     (t_prefill_end - t_prefill_start)/1000.0,
-                    st_prefill.time_us/1000.0);
+                    st_prefill.time_us/1000.0,
+                    kv_prefill_us/1000.0);
 
             cb.phase = "decode";
             cb.seq_len = seq_len;
             cb.repeat = rep;
             ggml_backend_moe_copy_stats_reset();
+            ggml_backend_kv_copy_stats_reset();
             LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=decode start tokens=%d\n",
                     mode_label.c_str(), seq_len, rep + 1, bench.repeats, bench.decode_tokens);
             const int64_t t_decode_start = ggml_time_us();
@@ -632,14 +708,17 @@ static bool run_model_bench(
             }
             const int64_t t_decode_end = ggml_time_us();
             auto st_decode = ggml_backend_moe_copy_stats_get();
+            const uint64_t kv_decode_us = append_attention_kv_copy_records(mode_label, "decode", seq_len, rep, node_records);
             copy_records.push_back({ mode_label, "decode", seq_len, rep, st_decode.calls, st_decode.bytes, st_decode.time_us });
-            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=decode done total_ms=%.3f moe_copy_ms=%.3f\n",
+            LOG_INF("bench: mode=%s seq_len=%d repeat=%d/%d phase=decode done total_ms=%.3f moe_copy_ms=%.3f kv_h2d_ms=%.3f\n",
                     mode_label.c_str(), seq_len, rep + 1, bench.repeats,
                     (t_decode_end - t_decode_start)/1000.0,
-                    st_decode.time_us/1000.0);
+                    st_decode.time_us/1000.0,
+                    kv_decode_us/1000.0);
         }
     }
 
+    ggml_backend_kv_copy_stats_set_enabled(false);
     ggml_backend_moe_copy_stats_set_enabled(false);
     llama_batch_free(batch);
     llama_free(ctx);
@@ -928,7 +1007,8 @@ static void write_summary_csv(
         const std::filesystem::path & path,
         const std::vector<node_record> & nodes,
         const std::vector<copy_record> & copies,
-        const std::vector<micro_record> & micros) {
+        const std::vector<micro_record> & micros,
+        int32_t decode_tokens) {
     struct bucket {
         std::vector<double> values;
     };
@@ -954,7 +1034,11 @@ static void write_summary_csv(
     for (const auto & it : attn) {
         std::ostringstream key;
         key << "attention_layer," << it.first.mode << "," << it.first.phase << "," << it.first.seq_len << "," << it.first.layer << ",time_us";
-        buckets[key.str()].values.push_back((double) it.second);
+        double value = (double) it.second;
+        if (it.first.phase == "decode" && decode_tokens > 0) {
+            value /= (double) decode_tokens;
+        }
+        buckets[key.str()].values.push_back(value);
     }
 
     for (const auto & rec : copies) {
@@ -1006,7 +1090,8 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "\n```\n\n";
     report << "## Config\n\n";
     report << "- mode: `" << bench.mode << "`\n";
-    report << "- attention_backend: `" << bench.attention_backend << "`\n";
+    report << "- attention_placement: `" << bench.attention_placement << "`\n";
+    report << "- attention_backend_compat: `" << bench.attention_backend << "`\n";
     report << "- repeats: `" << bench.repeats << "`\n";
     report << "- decode_tokens: `" << bench.decode_tokens << "`\n";
     report << "- profile_all_nodes: `" << (bench.profile_all_nodes ? 1 : 0) << "`\n";
@@ -1032,10 +1117,10 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- experts: `" << info.n_expert << "`\n";
     report << "- expert FFN: `" << info.n_ff_exp << "`\n\n";
     report << "## Outputs\n\n";
-    report << "- `results.jsonl`: raw node, attention-layer, runtime MoE-copy, pinned H2D copy, and microbench records\n";
-    report << "- `summary.csv`: aggregated averages and stddevs\n";
+    report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, pinned H2D copy, and microbench records\n";
+    report << "- `summary.csv`: aggregated averages and stddevs; decode attention_layer rows are per-token averages\n";
     report << "- `plots/*.svg`: generated by `plot_qwen3vl_moe_bench.py`\n\n";
-    report << "Note: runtime MoE-copy profiling synchronizes the destination backend around used-expert copies, so it is for measurement rather than maximum-throughput serving.\n";
+    report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving.\n";
 }
 
 int main(int argc, char ** argv) {
@@ -1057,7 +1142,7 @@ int main(int argc, char ** argv) {
     })) {
         return 1;
     }
-    if (bench.mode == "moe_cpu_offload" && bench.attention_backend == "gpu" &&
+    if (bench.mode == "moe_cpu_offload" && any_placement_attn_gpu(bench) &&
             params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
@@ -1082,17 +1167,22 @@ int main(int argc, char ** argv) {
     bool ok = true;
 
     if (!bench.skip_model_bench) {
+        const std::vector<std::string> placements = attention_placements_to_run(bench);
         if (bench.mode == "moe_cpu_sweep") {
-            for (int32_t n_cpu_moe : bench.n_cpu_moe_sweep) {
-                std::vector<std::string> owned_patterns;
-                std::string mode_label = make_mode_label(bench, "moe_cpu_sweep", n_cpu_moe);
-                common_params run_params = make_run_params(params, bench, "moe_cpu_sweep", n_cpu_moe, owned_patterns);
-                ok = run_model_bench(bench, run_params, mode_label, node_records, copy_records, info) && ok;
+            for (const std::string & placement : placements) {
+                for (int32_t n_cpu_moe : bench.n_cpu_moe_sweep) {
+                    std::vector<std::string> owned_patterns;
+                    std::string mode_label = make_mode_label(placement, "moe_cpu_sweep", n_cpu_moe);
+                    common_params run_params = make_run_params(params, bench, "moe_cpu_sweep", placement, n_cpu_moe, owned_patterns);
+                    ok = run_model_bench(bench, run_params, mode_label, placement, node_records, copy_records, info) && ok;
+                }
             }
         } else {
-            std::vector<std::string> owned_patterns;
-            common_params run_params = make_run_params(params, bench, bench.mode, bench.n_cpu_moe_layers, owned_patterns);
-            ok = run_model_bench(bench, run_params, make_mode_label(bench, bench.mode, bench.n_cpu_moe_layers), node_records, copy_records, info) && ok;
+            for (const std::string & placement : placements) {
+                std::vector<std::string> owned_patterns;
+                common_params run_params = make_run_params(params, bench, bench.mode, placement, bench.n_cpu_moe_layers, owned_patterns);
+                ok = run_model_bench(bench, run_params, make_mode_label(placement, bench.mode, bench.n_cpu_moe_layers), placement, node_records, copy_records, info) && ok;
+            }
         }
     }
 
@@ -1103,7 +1193,7 @@ int main(int argc, char ** argv) {
 
     const std::filesystem::path out_dir = bench.out_dir;
     write_raw_jsonl(out_dir / "results.jsonl", node_records, copy_records, micro_records);
-    write_summary_csv(out_dir / "summary.csv", node_records, copy_records, micro_records);
+    write_summary_csv(out_dir / "summary.csv", node_records, copy_records, micro_records, bench.decode_tokens);
     write_report(out_dir / "report.md", bench, info, argc, argv);
 
     llama_backend_free();
