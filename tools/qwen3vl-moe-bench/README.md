@@ -72,11 +72,34 @@ python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
   --out-dir results/qwen3vl_moe_bench/plots
 ```
 
+Measure one routed expert copy from CPU pinned memory to GPU without rerunning
+the model benchmark:
+
+```sh
+./build/bin/llama-qwen3vl-moe-bench \
+  -m /path/to/Qwen3-VL-30B-A3B-Instruct.gguf \
+  --skip-model-bench \
+  --skip-gemm-microbench \
+  --repeats 100 \
+  -ngl auto \
+  --out-dir results/qwen3vl_expert_copy
+```
+
+Then combine the existing Attention summary with the expert-copy summary for
+the ratio plot:
+
+```sh
+python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
+  --summary results/qwen3vl_attn_placement/summary.csv \
+  --expert-summary results/qwen3vl_expert_copy/summary.csv \
+  --out-dir results/qwen3vl_attn_placement/plots
+```
+
 Outputs:
 
-- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, pinned H2D copy records, and microbench records.
+- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, and microbench records.
 - `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Microbench rows use `mode=micro_hN` for the active expert-count sweep.
 - `plots/figure1_attention_time.svg`: prefill/decode average per-layer Attention time.
-- `plots/figure2_attention_copy_ratio.svg`: average per-layer Attention time divided by one routed expert pinned H2D copy time.
+- `plots/figure2_attention_expert_copy_ratio.svg`: `KV CPU + Attn CPU` average per-layer Attention time divided by one routed expert pinned H2D copy time.
 - `plots/figure3_moe_gemm.svg`: Serial vs Group GEMM full expert FFN sweep for `h=1..8`.
 - `report.md`: command and configuration snapshot.

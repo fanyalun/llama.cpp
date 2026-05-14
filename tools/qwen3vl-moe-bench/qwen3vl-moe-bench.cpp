@@ -39,6 +39,7 @@ struct bench_params {
     int32_t n_cpu_moe_layers = -1;
     bool skip_model_bench = false;
     bool skip_microbench = false;
+    bool skip_gemm_microbench = false;
     bool profile_all_nodes = true;
     int32_t micro_experts = 8;
     int32_t micro_d_model = 2048;
@@ -192,8 +193,9 @@ static void print_usage(const char * argv0) {
     LOG("  --n-cpu-moe-sweep <csv>                          default: 48,36,24,12,0\n");
     LOG("  --skip-model-bench <0|1>                         default: 0\n");
     LOG("  --skip-microbench <0|1>                          default: 0\n");
+    LOG("  --skip-gemm-microbench <0|1>                     default: 0; still runs expert H2D copy\n");
     LOG("  --profile-all-nodes <0|1>                        default: 1, exact but slower node timing\n");
-    LOG("  --expert-bytes <bytes|MiB|GiB>                   override H2D copy size\n");
+    LOG("  --expert-bytes <bytes|MiB|GiB>                   override reported expert copy bytes\n");
     LOG("  --micro-experts <n>                              default: 8\n");
     LOG("  --micro-d-model <n>                              default: model n_embd or 2048\n");
     LOG("  --micro-d-ff <n>                                 default: model expert FFN or 4096\n");
@@ -253,6 +255,8 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.skip_model_bench = optional_bool_value(true);
             } else if (arg == "--skip-microbench") {
                 bench.skip_microbench = optional_bool_value(true);
+            } else if (arg == "--skip-gemm-microbench") {
+                bench.skip_gemm_microbench = optional_bool_value(true);
             } else if (arg == "--profile-all-nodes") {
                 bench.profile_all_nodes = optional_bool_value(true);
             } else if (arg == "--expert-bytes") {
@@ -732,6 +736,25 @@ static bool run_model_bench(
     return true;
 }
 
+static bool load_model_info_metadata(common_params params, model_info & info) {
+    params.no_alloc = true;
+    llama_model_params model_params = common_model_params_to_llama(params);
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+    if (model == nullptr) {
+        LOG_WRN("%s: failed to load metadata; microbench will use explicit/default dimensions\n", __func__);
+        return true;
+    }
+
+    const std::string arch = meta_str(model, "general.architecture", "");
+    info.n_layer  = llama_model_n_layer(model);
+    info.n_embd   = llama_model_n_embd(model);
+    info.n_expert = (int32_t) meta_i64(model, arch + ".expert_count", info.n_expert);
+    info.n_ff_exp = (int32_t) meta_i64(model, arch + ".expert_feed_forward_length", info.n_ff_exp);
+
+    llama_model_free(model);
+    return true;
+}
+
 static ggml_backend_dev_t first_gpu_device() {
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -772,24 +795,23 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
         return true;
     }
 
-    size_t bytes = bench.expert_bytes;
-    if (bytes == 0) {
-        const int32_t d_model = info.n_embd > 0 ? info.n_embd : bench.micro_d_model;
-        const int32_t d_ff = info.n_ff_exp > 0 ? info.n_ff_exp : bench.micro_d_ff;
-        bytes = (size_t) (2*d_model*d_ff + d_ff*d_model) * sizeof(ggml_fp16_t);
-    }
-    bytes = std::max<size_t>(bytes, 1);
+    const int32_t d_model = info.n_embd > 0 ? info.n_embd : bench.micro_d_model;
+    const int32_t d_ff = info.n_ff_exp > 0 ? info.n_ff_exp : bench.micro_d_ff;
+    const int32_t n_experts = 2;
 
-    const size_t n_elems = (bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
     ggml_init_params init_params = {
-        /* .mem_size   = */ 2*ggml_tensor_overhead() + 1024,
+        /* .mem_size   = */ 6*ggml_tensor_overhead() + 1024,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
     ggml_context * ctx_src = ggml_init(init_params);
     ggml_context * ctx_dst = ggml_init(init_params);
-    ggml_tensor * src = ggml_new_tensor_1d(ctx_src, GGML_TYPE_I32, (int64_t) n_elems);
-    ggml_tensor * dst = ggml_new_tensor_1d(ctx_dst, GGML_TYPE_I32, (int64_t) n_elems);
+    ggml_tensor * gate_src = ggml_new_tensor_3d(ctx_src, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * up_src   = ggml_new_tensor_3d(ctx_src, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * down_src = ggml_new_tensor_3d(ctx_src, GGML_TYPE_F16, d_ff, d_model, n_experts);
+    ggml_tensor * gate_dst = ggml_new_tensor_3d(ctx_dst, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * up_dst   = ggml_new_tensor_3d(ctx_dst, GGML_TYPE_F16, d_model, d_ff, n_experts);
+    ggml_tensor * down_dst = ggml_new_tensor_3d(ctx_dst, GGML_TYPE_F16, d_ff, d_model, n_experts);
 
     ggml_backend_buffer_t host_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_src, host_buft);
     if (host_buf == nullptr) {
@@ -810,12 +832,42 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
     }
     ggml_backend_buffer_clear(host_buf, 0x7f);
 
-    for (int32_t rep = 0; rep < bench.repeats; ++rep) {
+    auto copy_one_expert = [&](ggml_tensor * dst, ggml_tensor * src, int32_t expert_id) -> uint64_t {
+        const size_t expert_size = src->nb[2];
+        const size_t expert_offset = (size_t) expert_id * expert_size;
+        const size_t padding = std::min<size_t>(expert_size, 512);
+        const size_t padding_end = expert_id < n_experts - 1 ? padding : 0;
+        const size_t copy_size = expert_size + padding_end;
+
         const int64_t t0 = ggml_time_us();
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(dst));
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + expert_offset, expert_offset, copy_size);
         ggml_backend_synchronize(backend);
         const int64_t t1 = ggml_time_us();
-        out.push_back({ "h2d_pinned", "copy", 0, 0, 1, rep, t1 - t0, (uint64_t) ggml_nbytes(dst) });
+        return (uint64_t) (t1 - t0);
+    };
+
+    auto full_expert_bytes = [&]() -> uint64_t {
+        if (bench.expert_bytes > 0) {
+            return (uint64_t) bench.expert_bytes;
+        }
+        uint64_t bytes = 0;
+        for (ggml_tensor * t : { gate_src, up_src, down_src }) {
+            const size_t expert_size = t->nb[2];
+            bytes += expert_size + std::min<size_t>(expert_size, 512);
+        }
+        return bytes;
+    };
+
+    copy_one_expert(gate_dst, gate_src, 0);
+    copy_one_expert(up_dst,   up_src,   0);
+    copy_one_expert(down_dst, down_src, 0);
+
+    for (int32_t rep = 0; rep < bench.repeats; ++rep) {
+        uint64_t time_us = 0;
+        time_us += copy_one_expert(gate_dst, gate_src, 0);
+        time_us += copy_one_expert(up_dst,   up_src,   0);
+        time_us += copy_one_expert(down_dst, down_src, 0);
+        out.push_back({ "expert_h2d_pinned", "copy", 0, 0, 1, rep, (int64_t) time_us, full_expert_bytes() });
     }
 
     ggml_backend_buffer_free(gpu_buf);
@@ -1100,6 +1152,8 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- attention_backend_compat: `" << bench.attention_backend << "`\n";
     report << "- repeats: `" << bench.repeats << "`\n";
     report << "- decode_tokens: `" << bench.decode_tokens << "`\n";
+    report << "- skip_microbench: `" << (bench.skip_microbench ? 1 : 0) << "`\n";
+    report << "- skip_gemm_microbench: `" << (bench.skip_gemm_microbench ? 1 : 0) << "`\n";
     report << "- profile_all_nodes: `" << (bench.profile_all_nodes ? 1 : 0) << "`\n";
     report << "- micro tokens: `";
     for (size_t i = 0; i < bench.micro_tokens.size(); ++i) {
@@ -1123,7 +1177,7 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- experts: `" << info.n_expert << "`\n";
     report << "- expert FFN: `" << info.n_ff_exp << "`\n\n";
     report << "## Outputs\n\n";
-    report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, pinned H2D copy, and microbench records\n";
+    report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, expert_h2d_pinned, and microbench records\n";
     report << "- `summary.csv`: aggregated averages and stddevs; decode attention_layer rows are per-token averages\n";
     report << "- `plots/*.svg`: generated by `plot_qwen3vl_moe_bench.py`\n\n";
     report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving.\n";
@@ -1193,8 +1247,13 @@ int main(int argc, char ** argv) {
     }
 
     if (!bench.skip_microbench) {
+        if ((info.n_embd <= 0 || info.n_ff_exp <= 0) && !params.model.path.empty()) {
+            ok = load_model_info_metadata(params, info) && ok;
+        }
         ok = run_h2d_microbench(bench, info, micro_records) && ok;
-        ok = run_gemm_microbench(bench, info, micro_records) && ok;
+        if (!bench.skip_gemm_microbench) {
+            ok = run_gemm_microbench(bench, info, micro_records) && ok;
+        }
     }
 
     const std::filesystem::path out_dir = bench.out_dir;
