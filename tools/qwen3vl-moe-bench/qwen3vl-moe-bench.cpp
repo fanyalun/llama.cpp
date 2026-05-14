@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 
@@ -736,22 +737,54 @@ static bool run_model_bench(
     return true;
 }
 
-static bool load_model_info_metadata(common_params params, model_info & info) {
-    params.no_alloc = true;
-    llama_model_params model_params = common_model_params_to_llama(params);
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
-    if (model == nullptr) {
-        LOG_WRN("%s: failed to load metadata; microbench will use explicit/default dimensions\n", __func__);
+static int64_t gguf_i64_or(const gguf_context * ctx, const std::string & key, int64_t fallback) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) {
+        return fallback;
+    }
+
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8:  return gguf_get_val_u8(ctx, id);
+        case GGUF_TYPE_INT8:   return gguf_get_val_i8(ctx, id);
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, id);
+        case GGUF_TYPE_INT16:  return gguf_get_val_i16(ctx, id);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, id);
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx, id);
+        case GGUF_TYPE_UINT64: return (int64_t) gguf_get_val_u64(ctx, id);
+        case GGUF_TYPE_INT64:  return gguf_get_val_i64(ctx, id);
+        default:               return fallback;
+    }
+}
+
+static std::string gguf_str_or(const gguf_context * ctx, const std::string & key, const std::string & fallback) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_STRING) {
+        return fallback;
+    }
+    const char * value = gguf_get_val_str(ctx, id);
+    return value == nullptr ? fallback : value;
+}
+
+static bool load_model_info_metadata(const common_params & params, model_info & info) {
+    gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context * gguf = gguf_init_from_file(params.model.path.c_str(), gguf_params);
+    if (gguf == nullptr) {
+        LOG_WRN("%s: failed to load GGUF metadata; microbench will use explicit/default dimensions\n", __func__);
         return true;
     }
 
-    const std::string arch = meta_str(model, "general.architecture", "");
-    info.n_layer  = llama_model_n_layer(model);
-    info.n_embd   = llama_model_n_embd(model);
-    info.n_expert = (int32_t) meta_i64(model, arch + ".expert_count", info.n_expert);
-    info.n_ff_exp = (int32_t) meta_i64(model, arch + ".expert_feed_forward_length", info.n_ff_exp);
+    const std::string arch = gguf_str_or(gguf, "general.architecture", "");
+    if (!arch.empty()) {
+        info.n_layer  = (int32_t) gguf_i64_or(gguf, arch + ".block_count", info.n_layer);
+        info.n_embd   = (int32_t) gguf_i64_or(gguf, arch + ".embedding_length", info.n_embd);
+        info.n_expert = (int32_t) gguf_i64_or(gguf, arch + ".expert_count", info.n_expert);
+        info.n_ff_exp = (int32_t) gguf_i64_or(gguf, arch + ".expert_feed_forward_length", info.n_ff_exp);
+    }
 
-    llama_model_free(model);
+    gguf_free(gguf);
     return true;
 }
 
