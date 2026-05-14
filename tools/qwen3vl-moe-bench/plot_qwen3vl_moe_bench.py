@@ -21,6 +21,12 @@ COLORS = [
     "#4338ca",
 ]
 
+ATTENTION_METHODS = [
+    ("kv_gpu_attn_gpu", "KV GPU + Attn GPU"),
+    ("kv_cpu_attn_cpu", "KV CPU + Attn CPU"),
+    ("kv_cpu_attn_gpu", "KV CPU + Attn GPU"),
+]
+
 
 def read_summary(path):
     rows = []
@@ -124,6 +130,75 @@ def plot_lines(path, title, series, x_label, y_label):
         f.write("</svg>\n")
 
 
+def plot_attention_panels(path, attn):
+    width, height = 1120, 560
+    left, right, top, bottom = 78, 28, 72, 116
+    gap = 58
+    panel_w = (width - left - right - gap) / 2
+    panel_h = height - top - bottom
+    phases = ["prefill", "decode"]
+    points = [
+        (x, y)
+        for (_, phase, x), y in attn.items()
+        if phase in phases
+    ]
+    if not points:
+        return
+
+    xs = sorted(set(x for x, _ in points))
+    x_min, x_max = min(xs), max(xs)
+    if x_min == x_max:
+        x_min = 0
+    y_max = nice_max(max(y for _, y in points))
+
+    def sx(x, panel_idx):
+        px = left + panel_idx * (panel_w + gap)
+        return px + (x - x_min) / (x_max - x_min) * panel_w
+
+    def sy(y):
+        return top + panel_h - y / y_max * panel_h
+
+    with open(path, "w") as f:
+        f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
+        f.write('<rect width="100%" height="100%" fill="#ffffff"/>\n')
+        text_svg(f, left, 34, "Attention Time", size=22, anchor="start", weight="700")
+
+        for pidx, phase in enumerate(phases):
+            px = left + pidx * (panel_w + gap)
+            text_svg(f, px + panel_w / 2, top - 18, phase.title(), size=15, weight="700")
+            line_svg(f, px, top + panel_h, px + panel_w, top + panel_h)
+            line_svg(f, px, top, px, top + panel_h)
+            for i in range(6):
+                y = y_max * i / 5
+                yy = sy(y)
+                line_svg(f, px, yy, px + panel_w, yy, color="#e5e7eb")
+                text_svg(f, px - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
+            for x in xs:
+                xx = sx(x, pidx)
+                line_svg(f, xx, top + panel_h, xx, top + panel_h + 5)
+                text_svg(f, xx, top + panel_h + 23, fmt_x(x), color="#374151")
+            for midx, (method, label) in enumerate(ATTENTION_METHODS):
+                pts = sorted((x, y) for (m, p, x), y in attn.items() if m == method and p == phase)
+                if not pts:
+                    continue
+                color = COLORS[midx % len(COLORS)]
+                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
+                f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.5"/>\n')
+                for x, y in pts:
+                    f.write(f'<circle cx="{sx(x, pidx):.1f}" cy="{sy(y):.1f}" r="3.5" fill="{color}"/>\n')
+
+        for idx, (_, label) in enumerate(ATTENTION_METHODS):
+            color = COLORS[idx % len(COLORS)]
+            lx = left + 18 + idx * 300
+            ly = top + panel_h + 58
+            line_svg(f, lx, ly - 4, lx + 24, ly - 4, color=color, width=2.5)
+            text_svg(f, lx + 32, ly, label, anchor="start")
+
+        text_svg(f, left + (width - left - right) / 2, height - 18, "sequence length", size=13)
+        text_svg(f, 18, top + panel_h / 2, "avg layer time (ms)", size=13, rotate=-90)
+        f.write("</svg>\n")
+
+
 def plot_moe_gemm(path, panels):
     width, height = 1120, 620
     left, right, top, bottom = 72, 28, 70, 124
@@ -200,15 +275,24 @@ def average_attention(rows):
     grouped = defaultdict(list)
     for r in rows:
         if r["kind"] == "attention_layer" and r["metric"] == "time_us":
-            grouped[(r["mode"], r["phase"], r["x"])].append(r["avg"] / 1000.0)
+            mode = attention_method(r["mode"])
+            if mode:
+                grouped[(mode, r["phase"], r["x"])].append(r["avg"] / 1000.0)
     return {k: sum(v) / len(v) for k, v in grouped.items() if v}
 
 
-def attention_label(mode, phase):
+def attention_method(mode):
     prefix = "moe_cpu_offload_"
     if mode.startswith(prefix):
         mode = mode[len(prefix):]
-    return f"{mode} {phase}"
+    if mode in {method for method, _ in ATTENTION_METHODS}:
+        return mode
+    return None
+
+
+def attention_label(mode, phase):
+    labels = dict(ATTENTION_METHODS)
+    return f"{labels.get(mode, mode)} {phase}"
 
 
 def micro_h(row):
@@ -234,13 +318,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     attn = average_attention(rows)
-    attention_series = []
-    for mode in sorted({m for (m, _, _) in attn}):
-        for phase in ["prefill", "decode"]:
-            pts = sorted((x, y) for (m, p, x), y in attn.items() if m == mode and p == phase)
-            if pts:
-                attention_series.append((attention_label(mode, phase), pts))
-    plot_lines(out_dir / "figure1_attention_time.svg", "Attention Time", attention_series, "sequence length", "avg layer time (ms)")
+    plot_attention_panels(out_dir / "figure1_attention_time.svg", attn)
 
     copy_times = [r["avg"] / 1000.0 for r in rows if r["kind"] == "h2d_pinned" and r["metric"] == "time_us"]
     if copy_times:
