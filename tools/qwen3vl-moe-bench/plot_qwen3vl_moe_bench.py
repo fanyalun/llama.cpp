@@ -149,14 +149,18 @@ def plot_attention_panels(path, attn):
     x_min, x_max = min(xs), max(xs)
     if x_min == x_max:
         x_min = 0
-    y_max = nice_max(max(y for _, y in points))
+    y_max_by_phase = {}
+    for phase in phases:
+        phase_ys = [y for (_, p, _), y in attn.items() if p == phase]
+        if phase_ys:
+            y_max_by_phase[phase] = nice_max(max(phase_ys))
 
     def sx(x, panel_idx):
         px = left + panel_idx * (panel_w + gap)
         return px + (x - x_min) / (x_max - x_min) * panel_w
 
-    def sy(y):
-        return top + panel_h - y / y_max * panel_h
+    def sy(y, phase):
+        return top + panel_h - y / y_max_by_phase[phase] * panel_h
 
     with open(path, "w") as f:
         f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
@@ -169,8 +173,8 @@ def plot_attention_panels(path, attn):
             line_svg(f, px, top + panel_h, px + panel_w, top + panel_h)
             line_svg(f, px, top, px, top + panel_h)
             for i in range(6):
-                y = y_max * i / 5
-                yy = sy(y)
+                y = y_max_by_phase[phase] * i / 5
+                yy = sy(y, phase)
                 line_svg(f, px, yy, px + panel_w, yy, color="#e5e7eb")
                 text_svg(f, px - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
             for x in xs:
@@ -182,10 +186,10 @@ def plot_attention_panels(path, attn):
                 if not pts:
                     continue
                 color = COLORS[midx % len(COLORS)]
-                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y):.1f}" for i, (x, y) in enumerate(pts))
+                path_data = " ".join(("M" if i == 0 else "L") + f"{sx(x, pidx):.1f},{sy(y, phase):.1f}" for i, (x, y) in enumerate(pts))
                 f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.5"/>\n')
                 for x, y in pts:
-                    f.write(f'<circle cx="{sx(x, pidx):.1f}" cy="{sy(y):.1f}" r="3.5" fill="{color}"/>\n')
+                    f.write(f'<circle cx="{sx(x, pidx):.1f}" cy="{sy(y, phase):.1f}" r="3.5" fill="{color}"/>\n')
 
         for idx, (_, label) in enumerate(ATTENTION_METHODS):
             color = COLORS[idx % len(COLORS)]
