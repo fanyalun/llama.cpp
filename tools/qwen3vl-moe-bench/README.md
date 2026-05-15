@@ -99,6 +99,14 @@ Measure the Alpha MoE GEMM sweep without rerunning the model benchmark:
   --out-dir results/qwen3vl_moe_gemm
 ```
 
+The Alpha sweep uses `ggml_mul_mat_id` on both sides of the split. The prefix
+experts selected by `alpha` are measured as one routed `mul_mat_id` path with
+multiple expert ids, while the remaining suffix experts are measured by
+looping over experts and calling `mul_mat_id` once per expert with a single
+expert id. This keeps the comparison focused on routed-MoE grouping versus
+per-expert routed execution, rather than comparing `mul_mat_id` against plain
+`ggml_mul_mat`.
+
 Measure the Alpha MoE GEMM sweep with real layer-10 token-to-expert routing
 from the AIME allresults JSON:
 

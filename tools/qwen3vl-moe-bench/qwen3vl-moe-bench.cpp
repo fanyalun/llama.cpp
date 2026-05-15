@@ -1257,7 +1257,7 @@ static ggml_tensor * build_group_routed_path(
         int32_t d_ff,
         int32_t group_experts,
         const std::vector<int32_t> & token_counts,
-        std::vector<int32_t> & ids_data) {
+        std::map<std::string, std::vector<int32_t>> & ids_overrides) {
     int32_t total_tokens = 0;
     for (int32_t i = 0; i < group_experts; ++i) {
         total_tokens += token_counts[i];
@@ -1273,13 +1273,14 @@ static ggml_tensor * build_group_routed_path(
     ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, total_tokens);
     ggml_set_name(ids, "micro_group_ids");
 
-    ids_data.clear();
+    std::vector<int32_t> ids_data;
     ids_data.reserve((size_t) total_tokens);
     for (int32_t expert = 0; expert < group_experts; ++expert) {
         for (int32_t t = 0; t < token_counts[expert]; ++t) {
             ids_data.push_back(expert);
         }
     }
+    ids_overrides[ggml_get_name(ids)] = std::move(ids_data);
 
     ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
     ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
@@ -1293,7 +1294,8 @@ static void build_serial_routed_paths(
         int32_t d_model,
         int32_t d_ff,
         int32_t first_expert,
-        const std::vector<int32_t> & token_counts) {
+        const std::vector<int32_t> & token_counts,
+        std::map<std::string, std::vector<int32_t>> & ids_overrides) {
     const int32_t serial_experts = (int32_t) token_counts.size() - first_expert;
     if (serial_experts <= 0) {
         return;
@@ -1309,15 +1311,16 @@ static void build_serial_routed_paths(
             continue;
         }
         const int32_t local = expert - first_expert;
-        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, n_tokens);
-        ggml_tensor * gate_i = ggml_view_2d(ctx, gate, d_model, d_ff, gate->nb[1], local*gate->nb[2]);
-        ggml_tensor * up_i   = ggml_view_2d(ctx, up,   d_model, d_ff, up->nb[1],   local*up->nb[2]);
-        ggml_tensor * down_i = ggml_view_2d(ctx, down, d_ff, d_model, down->nb[1], local*down->nb[2]);
+        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
+        ggml_tensor * ids    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        const std::string ids_name = "micro_serial_ids_" + std::to_string(expert);
+        ggml_set_name(ids, ids_name.c_str());
+        ids_overrides[ids_name] = std::vector<int32_t>((size_t) n_tokens, local);
 
-        ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate_i, x);
-        ggml_tensor * ffn_up   = ggml_mul_mat(ctx, up_i,   x);
+        ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
+        ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
         ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
-        ggml_tensor * y        = ggml_mul_mat(ctx, down_i, act);
+        ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
         ggml_build_forward_expand(gf, y);
     }
 }
@@ -1328,12 +1331,12 @@ static ggml_cgraph * build_alpha_gemm_graph(
         int32_t d_ff,
         int32_t group_experts,
         const std::vector<int32_t> & token_counts,
-        std::vector<int32_t> & ids_data) {
+        std::map<std::string, std::vector<int32_t>> & ids_overrides) {
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    if (ggml_tensor * y_group = build_group_routed_path(ctx, d_model, d_ff, group_experts, token_counts, ids_data)) {
+    if (ggml_tensor * y_group = build_group_routed_path(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides)) {
         ggml_build_forward_expand(gf, y_group);
     }
-    build_serial_routed_paths(ctx, gf, d_model, d_ff, group_experts, token_counts);
+    build_serial_routed_paths(ctx, gf, d_model, d_ff, group_experts, token_counts, ids_overrides);
     return gf;
 }
 
@@ -1381,7 +1384,7 @@ static std::vector<int32_t> make_decode_token_counts(int32_t active_experts) {
     return std::vector<int32_t>((size_t) active_experts, 1);
 }
 
-static bool fill_graph_inputs(ggml_context * ctx, const std::vector<int32_t> * ids_override = nullptr) {
+static bool fill_graph_inputs(ggml_context * ctx, const std::map<std::string, std::vector<int32_t>> * ids_overrides = nullptr) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (t->data == nullptr || t->op != GGML_OP_NONE) {
             continue;
@@ -1397,9 +1400,15 @@ static bool fill_graph_inputs(ggml_context * ctx, const std::vector<int32_t> * i
             ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
         } else if (t->type == GGML_TYPE_I32) {
             std::vector<int32_t> ids((size_t) ggml_nelements(t));
-            if (ids_override != nullptr && ids_override->size() == ids.size()) {
-                ids = *ids_override;
-            } else {
+            bool has_override = false;
+            if (ids_overrides != nullptr) {
+                const auto it = ids_overrides->find(ggml_get_name(t));
+                if (it != ids_overrides->end() && it->second.size() == ids.size()) {
+                    ids = it->second;
+                    has_override = true;
+                }
+            }
+            if (!has_override) {
                 for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
                     for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
                         ids[(size_t) (i1*t->ne[0] + i0)] = (int32_t) i0;
@@ -1513,9 +1522,9 @@ static bool run_one_alpha_gemm_micro(
         /* .no_alloc   = */ true,
     };
 
-    std::vector<int32_t> ids_data;
+    std::map<std::string, std::vector<int32_t>> ids_overrides;
     ggml_context * ctx = ggml_init(init_params);
-    ggml_cgraph * gf = build_alpha_gemm_graph(ctx, d_model, d_ff, group_experts, token_counts, ids_data);
+    ggml_cgraph * gf = build_alpha_gemm_graph(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (buf == nullptr) {
@@ -1524,7 +1533,7 @@ static bool run_one_alpha_gemm_micro(
         return true;
     }
 
-    fill_graph_inputs(ctx, ids_data.empty() ? nullptr : &ids_data);
+    fill_graph_inputs(ctx, ids_overrides.empty() ? nullptr : &ids_overrides);
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         LOG_WRN("%s: warmup failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
