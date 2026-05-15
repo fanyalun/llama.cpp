@@ -203,7 +203,7 @@ def plot_attention_panels(path, attn):
         f.write("</svg>\n")
 
 
-def plot_ratio_panels(path, ratios):
+def plot_ratio_panels(path, ratios, ratio_label):
     width, height = 1120, 520
     left, right, top, bottom = 78, 28, 72, 88
     gap = 58
@@ -267,7 +267,7 @@ def plot_ratio_panels(path, ratios):
         lx = left + 18
         ly = top + panel_h + 56
         line_svg(f, lx, ly - 4, lx + 24, ly - 4, color=COLORS[1], width=2.5)
-        text_svg(f, lx + 32, ly, "KV CPU + Attn CPU / one expert H2D", anchor="start")
+        text_svg(f, lx + 32, ly, f"{ratio_label} / one expert H2D", anchor="start")
         text_svg(f, left + (width - left - right) / 2, height - 18, "sequence length", size=13)
         text_svg(f, 18, top + panel_h / 2, "ratio", size=13, rotate=-90)
         f.write("</svg>\n")
@@ -408,6 +408,10 @@ def main():
     parser.add_argument("--summary", required=True, help="Path to summary.csv")
     parser.add_argument("--expert-summary", help="Optional summary.csv that contains expert_h2d_pinned rows")
     parser.add_argument("--out-dir", required=True, help="Directory for SVG plots")
+    parser.add_argument("--ratio-mode", default="kv_cpu_attn_cpu", choices=[method for method, _ in ATTENTION_METHODS],
+                        help="Attention placement to divide by one expert H2D copy time")
+    parser.add_argument("--ratio-output", default="figure2_attention_expert_copy_ratio.svg",
+                        help="Output filename for the attention/expert-copy ratio plot")
     args = parser.parse_args()
 
     rows = read_summary(args.summary)
@@ -425,9 +429,9 @@ def main():
         ratio = {
             (phase, x): y / expert_copy_ms
             for (mode, phase, x), y in attn.items()
-            if mode == "kv_cpu_attn_cpu"
+            if mode == args.ratio_mode
         }
-        plot_ratio_panels(out_dir / "figure2_attention_expert_copy_ratio.svg", ratio)
+        plot_ratio_panels(out_dir / args.ratio_output, ratio, dict(ATTENTION_METHODS)[args.ratio_mode])
 
     panels = []
     prefill_tokens = sorted({
