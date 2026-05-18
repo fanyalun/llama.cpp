@@ -1540,44 +1540,6 @@ static ggml_cgraph * build_group_routed_graph(
     return gf;
 }
 
-struct expert_graph {
-    int32_t expert = 0;
-    ggml_cgraph * graph = nullptr;
-};
-
-static void build_single_expert_routed_graphs(
-        ggml_context * ctx,
-        int32_t d_model,
-        int32_t d_ff,
-        const std::vector<int32_t> & token_counts,
-        std::map<std::string, std::vector<int32_t>> & ids_overrides,
-        std::vector<expert_graph> & graphs) {
-    for (int32_t expert = 0; expert < (int32_t) token_counts.size(); ++expert) {
-        const int32_t n_tokens = token_counts[expert];
-        if (n_tokens <= 0) {
-            continue;
-        }
-
-        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
-        ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
-        ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, 1);
-        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
-        ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
-        const std::string ids_name = "micro_cache_strategy_ids_" + std::to_string(expert);
-        ggml_set_name(ids, ids_name.c_str());
-        ids_overrides[ids_name] = std::vector<int32_t>((size_t) n_tokens, 0);
-
-        ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
-        ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
-        ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
-        ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
-
-        ggml_cgraph * gf = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf, y);
-        graphs.push_back({ expert, gf });
-    }
-}
-
 static ggml_cgraph * build_alpha_gemm_graph(
         ggml_context * ctx,
         int32_t d_model,
@@ -1763,6 +1725,130 @@ static bool measure_graph_us(ggml_backend_t backend, ggml_cgraph * gf, int64_t &
     return true;
 }
 
+static bool measure_group_routed_component(
+        ggml_backend_t backend,
+        int32_t d_model,
+        int32_t d_ff,
+        int32_t group_experts,
+        const std::vector<int32_t> & token_counts,
+        const bench_params & bench,
+        std::vector<int64_t> & times_us) {
+    times_us.assign((size_t) bench.repeats, 0);
+    if (group_experts <= 0) {
+        return true;
+    }
+
+    const size_t mem_size = 256ULL*1024ULL*1024ULL;
+    ggml_init_params init_params = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    std::map<std::string, std::vector<int32_t>> ids_overrides;
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_cgraph * gf = build_group_routed_graph(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides);
+    if (gf == nullptr) {
+        ggml_free(ctx);
+        return true;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    fill_graph_inputs(ctx, ids_overrides.empty() ? nullptr : &ids_overrides);
+
+    int64_t warmup_us = 0;
+    if (!measure_graph_us(backend, gf, warmup_us)) {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+
+    for (int32_t rep = 0; rep < bench.repeats; ++rep) {
+        if (!measure_graph_us(backend, gf, times_us[(size_t) rep])) {
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+static bool measure_single_expert_routed_component(
+        ggml_backend_t backend,
+        int32_t d_model,
+        int32_t d_ff,
+        int32_t expert,
+        int32_t n_tokens,
+        const bench_params & bench,
+        std::vector<int64_t> & times_us) {
+    times_us.assign((size_t) bench.repeats, 0);
+    if (n_tokens <= 0) {
+        return true;
+    }
+
+    const size_t mem_size = 64ULL*1024ULL*1024ULL;
+    ggml_init_params init_params = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    std::map<std::string, std::vector<int32_t>> ids_overrides;
+    ggml_context * ctx = ggml_init(init_params);
+
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
+    ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, 1);
+    ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+    const std::string ids_name = "micro_cache_strategy_ids_" + std::to_string(expert);
+    ggml_set_name(ids, ids_name.c_str());
+    ids_overrides[ids_name] = std::vector<int32_t>((size_t) n_tokens, 0);
+
+    ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
+    ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
+    ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+    ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    fill_graph_inputs(ctx, &ids_overrides);
+
+    int64_t warmup_us = 0;
+    if (!measure_graph_us(backend, gf, warmup_us)) {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+
+    for (int32_t rep = 0; rep < bench.repeats; ++rep) {
+        if (!measure_graph_us(backend, gf, times_us[(size_t) rep])) {
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
 static int64_t pipeline_total_us(
         int64_t group_compute_us,
         const std::vector<int64_t> & serial_compute_us,
@@ -1789,14 +1875,14 @@ static int64_t pipeline_total_us(
 }
 
 static std::vector<int64_t> aligned_load_times(
-        const std::vector<expert_graph> & graphs,
+        const std::vector<int32_t> & serial_experts,
         const std::vector<int64_t> & miss_load_us,
         int32_t hit_experts) {
     std::vector<int64_t> out;
-    out.reserve(graphs.size());
+    out.reserve(serial_experts.size());
     size_t miss_idx = 0;
-    for (const expert_graph & item : graphs) {
-        if (item.expert < hit_experts) {
+    for (const int32_t expert : serial_experts) {
+        if (expert < hit_experts) {
             out.push_back(0);
         } else {
             out.push_back(miss_idx < miss_load_us.size() ? miss_load_us[miss_idx++] : 0);
@@ -1869,44 +1955,38 @@ static bool run_one_cache_strategy_micro(
         return true;
     }
 
-    const size_t mem_size = 256ULL*1024ULL*1024ULL;
-    ggml_init_params init_params = {
-        /* .mem_size   = */ mem_size,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-
-    std::map<std::string, std::vector<int32_t>> ids_overrides;
-    std::vector<expert_graph> serial_graphs;
-    ggml_context * ctx = ggml_init(init_params);
-    ggml_cgraph * hit_group_gf = build_group_routed_graph(ctx, d_model, d_ff, hit_experts, token_counts, ids_overrides);
-    ggml_cgraph * all_group_gf = build_group_routed_graph(ctx, d_model, d_ff, active_experts, token_counts, ids_overrides);
-    build_single_expert_routed_graphs(ctx, d_model, d_ff, token_counts, ids_overrides, serial_graphs);
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (buf == nullptr) {
-        LOG_WRN("%s: failed to allocate cache-strategy tensors for %s\n", __func__, phase.c_str());
-        ggml_free(ctx);
+    std::vector<int64_t> hit_group_compute_by_rep;
+    std::vector<int64_t> all_group_compute_by_rep;
+    if (!measure_group_routed_component(backend, d_model, d_ff, hit_experts, token_counts, bench, hit_group_compute_by_rep)) {
+        LOG_WRN("%s: failed to measure hit group compute for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
+        return true;
+    }
+    if (!measure_group_routed_component(backend, d_model, d_ff, active_experts, token_counts, bench, all_group_compute_by_rep)) {
+        LOG_WRN("%s: failed to measure all group compute for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
         return true;
     }
 
-    fill_graph_inputs(ctx, ids_overrides.empty() ? nullptr : &ids_overrides);
+    std::vector<int32_t> serial_experts;
+    std::vector<std::vector<int64_t>> serial_compute_by_expert;
+    for (int32_t expert = 0; expert < active_experts; ++expert) {
+        if (token_counts[(size_t) expert] <= 0) {
+            continue;
+        }
 
-    int64_t warmup_time_us = 0;
-    if (!measure_graph_us(backend, hit_group_gf, warmup_time_us) ||
-            !measure_graph_us(backend, all_group_gf, warmup_time_us)) {
-        LOG_WRN("%s: group warmup failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
-        return true;
-    }
-    for (const expert_graph & item : serial_graphs) {
-        if (!measure_graph_us(backend, item.graph, warmup_time_us)) {
-            LOG_WRN("%s: serial warmup failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
-            ggml_backend_buffer_free(buf);
-            ggml_free(ctx);
+        std::vector<int64_t> expert_compute_by_rep;
+        if (!measure_single_expert_routed_component(
+                    backend,
+                    d_model,
+                    d_ff,
+                    expert,
+                    token_counts[(size_t) expert],
+                    bench,
+                    expert_compute_by_rep)) {
+            LOG_WRN("%s: failed to measure serial expert %d for %s cache%d\n", __func__, expert, phase.c_str(), cache_hit_pct);
             return true;
         }
+        serial_experts.push_back(expert);
+        serial_compute_by_expert.push_back(std::move(expert_compute_by_rep));
     }
 
     expert_h2d_state h2d_state;
@@ -1919,37 +1999,26 @@ static bool run_one_cache_strategy_micro(
     }
 
     for (int32_t rep = 0; rep < bench.repeats; ++rep) {
-        int64_t hit_group_compute_us = 0;
-        int64_t all_group_compute_us = 0;
-        if (!measure_graph_us(backend, hit_group_gf, hit_group_compute_us) ||
-                !measure_graph_us(backend, all_group_gf, all_group_compute_us)) {
-            LOG_WRN("%s: group compute failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
-            break;
-        }
-
+        const int64_t hit_group_compute_us = hit_group_compute_by_rep[(size_t) rep];
+        const int64_t all_group_compute_us = all_group_compute_by_rep[(size_t) rep];
         std::vector<int64_t> serial_compute_us;
-        serial_compute_us.reserve(serial_graphs.size());
-        for (const expert_graph & item : serial_graphs) {
-            int64_t expert_compute_us = 0;
-            if (!measure_graph_us(backend, item.graph, expert_compute_us)) {
-                LOG_WRN("%s: serial compute failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
-                expert_compute_us = 0;
-            }
-            serial_compute_us.push_back(expert_compute_us);
+        serial_compute_us.reserve(serial_compute_by_expert.size());
+        for (const auto & expert_compute_by_rep : serial_compute_by_expert) {
+            serial_compute_us.push_back(expert_compute_by_rep[(size_t) rep]);
         }
 
         std::vector<int64_t> miss_load_us;
-        miss_load_us.reserve(serial_graphs.size());
-        for (const expert_graph & item : serial_graphs) {
-            if (item.expert >= hit_experts) {
+        miss_load_us.reserve(serial_experts.size());
+        for (const int32_t expert : serial_experts) {
+            if (expert >= hit_experts) {
                 miss_load_us.push_back(h2d_ready && miss_experts > 0 ? (int64_t) measure_expert_h2d_us(backend, h2d_state) : 0);
             }
         }
 
         const std::vector<int64_t> miss_serial_compute_us = [&]() {
             std::vector<int64_t> values;
-            for (size_t i = 0; i < serial_graphs.size(); ++i) {
-                if (serial_graphs[i].expert >= hit_experts) {
+            for (size_t i = 0; i < serial_experts.size(); ++i) {
+                if (serial_experts[i] >= hit_experts) {
                     values.push_back(serial_compute_us[i]);
                 }
             }
@@ -1964,7 +2033,7 @@ static bool run_one_cache_strategy_micro(
         const int64_t serial_pipeline_us = pipeline_total_us(
                 0,
                 serial_compute_us,
-                aligned_load_times(serial_graphs, miss_load_us, hit_experts),
+                aligned_load_times(serial_experts, miss_load_us, hit_experts),
                 serial_total_us,
                 weight_load_total_us,
                 bubble_us);
@@ -1993,8 +2062,6 @@ static bool run_one_cache_strategy_micro(
     }
 
     free_expert_h2d_state(h2d_state);
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
     return true;
 }
 
