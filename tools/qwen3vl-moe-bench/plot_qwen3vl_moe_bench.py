@@ -27,6 +27,12 @@ ATTENTION_METHODS = [
     ("kv_cpu_attn_gpu", "KV CPU + Attn GPU"),
 ]
 
+STRATEGY_LABELS = {
+    "serial_pipeline": "Serial + pipeline",
+    "group_wait": "Group after loads",
+    "hybrid_pipeline": "Hybrid pipeline",
+}
+
 
 def read_summary(path):
     rows = []
@@ -346,6 +352,88 @@ def plot_moe_gemm(path, panels):
         f.write("</svg>\n")
 
 
+def plot_cache_strategy(path, prefill_series, decode_values, cache_pct):
+    width, height = 1120, 620
+    left, right, top, bottom = 82, 28, 70, 128
+    gap = 54
+    panel_w = (width - left - right - gap) / 2
+    panel_h = height - top - bottom
+    if not prefill_series and not decode_values:
+        return
+
+    prefill_points = [p for _, pts in prefill_series for p in pts]
+    decode_points = [(i, v) for i, (_, v) in enumerate(decode_values)]
+    y_max_prefill = nice_max(max([p[1] for p in prefill_points] or [1.0]))
+    y_max_decode = nice_max(max([p[1] for p in decode_points] or [1.0]))
+    prefill_xs = sorted(set(p[0] for p in prefill_points)) or [0, 1]
+    prefill_x_min, prefill_x_max = min(prefill_xs), max(prefill_xs)
+    if prefill_x_min == prefill_x_max:
+        prefill_x_min = 0
+
+    def sx_prefill(x):
+        return left + (x - prefill_x_min) / (prefill_x_max - prefill_x_min) * panel_w
+
+    def sx_decode(i):
+        px = left + panel_w + gap
+        if len(decode_values) <= 1:
+            return px + panel_w / 2
+        return px + i / (len(decode_values) - 1) * panel_w
+
+    def sy(y, y_max):
+        return top + panel_h - y / y_max * panel_h
+
+    with open(path, "w") as f:
+        f.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n')
+        f.write('<rect width="100%" height="100%" fill="#ffffff"/>\n')
+        text_svg(f, left, 34, f"MoE Cache Strategy (cache hit {cache_pct}%)", size=22, anchor="start", weight="700")
+
+        for pidx, (panel_name, y_max) in enumerate([("Prefill", y_max_prefill), ("Decode", y_max_decode)]):
+            px = left + pidx * (panel_w + gap)
+            text_svg(f, px + panel_w / 2, top - 18, panel_name, size=15, weight="700")
+            line_svg(f, px, top + panel_h, px + panel_w, top + panel_h)
+            line_svg(f, px, top, px, top + panel_h)
+            for i in range(6):
+                y = y_max * i / 5
+                yy = sy(y, y_max)
+                line_svg(f, px, yy, px + panel_w, yy, color="#e5e7eb")
+                text_svg(f, px - 10, yy + 4, f"{y:.2g}", anchor="end", color="#374151")
+
+        for x in prefill_xs:
+            xx = sx_prefill(x)
+            line_svg(f, xx, top + panel_h, xx, top + panel_h + 5)
+            text_svg(f, xx, top + panel_h + 23, fmt_x(x), color="#374151")
+        for idx, (name, pts) in enumerate(prefill_series):
+            color = COLORS[idx % len(COLORS)]
+            pts = sorted(pts)
+            path_data = " ".join(("M" if i == 0 else "L") + f"{sx_prefill(x):.1f},{sy(y, y_max_prefill):.1f}" for i, (x, y) in enumerate(pts))
+            f.write(f'<path d="{path_data}" fill="none" stroke="{color}" stroke-width="2.2"/>\n')
+            for x, y in pts:
+                f.write(f'<circle cx="{sx_prefill(x):.1f}" cy="{sy(y, y_max_prefill):.1f}" r="3.2" fill="{color}"/>\n')
+
+        for idx, (name, y) in enumerate(decode_values):
+            color = COLORS[idx % len(COLORS)]
+            xx = sx_decode(idx)
+            line_svg(f, xx, top + panel_h, xx, top + panel_h + 5)
+            text_svg(f, xx, top + panel_h + 24, STRATEGY_LABELS.get(name, name), size=10, color="#374151")
+            f.write(f'<circle cx="{xx:.1f}" cy="{sy(y, y_max_decode):.1f}" r="4.2" fill="{color}"/>\n')
+            if idx:
+                x0 = sx_decode(idx - 1)
+                y0 = decode_values[idx - 1][1]
+                line_svg(f, x0, sy(y0, y_max_decode), xx, sy(y, y_max_decode), color=color, width=2.0)
+
+        for idx, (name, _) in enumerate(prefill_series):
+            color = COLORS[idx % len(COLORS)]
+            lx = left + 10 + (idx % 3) * 300
+            ly = top + panel_h + 64 + (idx // 3) * 18
+            line_svg(f, lx, ly - 4, lx + 22, ly - 4, color=color, width=2.2)
+            text_svg(f, lx + 30, ly, STRATEGY_LABELS.get(name, name), anchor="start")
+
+        text_svg(f, left + panel_w / 2, height - 18, "sequence length", size=13)
+        text_svg(f, left + panel_w + gap + panel_w / 2, height - 18, "strategy", size=13)
+        text_svg(f, 18, top + panel_h / 2, "time (ms)", size=13, rotate=-90)
+        f.write("</svg>\n")
+
+
 def average_attention(rows):
     grouped = defaultdict(list)
     for r in rows:
@@ -401,6 +489,21 @@ def micro_alpha(row):
         except ValueError:
             return None
     return None
+
+
+def micro_cache_strategy(row):
+    mode = row["mode"]
+    prefix = "micro_cache"
+    if not mode.startswith(prefix):
+        return None
+    rest = mode[len(prefix):]
+    if "_" not in rest:
+        return None
+    pct, strategy = rest.split("_", 1)
+    try:
+        return int(pct), strategy
+    except ValueError:
+        return None
 
 
 def main():
@@ -463,6 +566,36 @@ def main():
     if decode_pts:
         panels.append(("decode", [("decode", decode_pts)]))
     plot_moe_gemm(out_dir / "figure3_moe_gemm.svg", panels)
+
+    cache_rows = [
+        r for r in rows
+        if r["kind"] == "moe_gemm_cache_strategy"
+        and micro_cache_strategy(r) is not None
+        and r["metric"] == "time_us"
+    ]
+    cache_pcts = sorted({micro_cache_strategy(r)[0] for r in cache_rows})
+    if cache_pcts:
+        cache_pct = cache_pcts[0]
+        strategies = ["serial_pipeline", "group_wait", "hybrid_pipeline"]
+        prefill_series = []
+        for strategy in strategies:
+            pts = [
+                (r["x"], r["avg"] / 1000.0)
+                for r in cache_rows
+                if r["phase"] == "prefill" and micro_cache_strategy(r) == (cache_pct, strategy)
+            ]
+            if pts:
+                prefill_series.append((strategy, pts))
+        decode_values = []
+        for strategy in strategies:
+            vals = [
+                r["avg"] / 1000.0
+                for r in cache_rows
+                if r["phase"] == "decode" and micro_cache_strategy(r) == (cache_pct, strategy)
+            ]
+            if vals:
+                decode_values.append((strategy, sum(vals) / len(vals)))
+        plot_cache_strategy(out_dir / "figure4_moe_cache_strategy.svg", prefill_series, decode_values, cache_pct)
 
 
 if __name__ == "__main__":

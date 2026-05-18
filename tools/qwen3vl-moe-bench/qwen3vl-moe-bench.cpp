@@ -39,6 +39,7 @@ struct bench_params {
     std::vector<int32_t> micro_experts_sweep = { 1, 2, 3, 4, 5, 6, 7, 8 };
     std::vector<int32_t> micro_alpha_pcts = { 0, 25, 50, 75, 100 };
     std::vector<int32_t> n_cpu_moe_sweep = { 48, 36, 24, 12, 0 };
+    double micro_cache_hit_rate = 0.5;
     int32_t decode_tokens = 16;
     int32_t repeats = 3;
     int32_t n_cpu_moe_layers = -1;
@@ -101,6 +102,10 @@ struct micro_record {
     int64_t serial_compute_us = 0;
     int64_t weight_load_us = 0;
     int64_t pipeline_bubble_us = 0;
+    int32_t cache_hit_pct = -1;
+    int32_t hit_experts = 0;
+    int32_t miss_experts = 0;
+    std::string strategy;
 };
 
 struct route_record {
@@ -232,6 +237,7 @@ static void print_usage(const char * argv0) {
     LOG("  --micro-experts <n>                              fallback active prefill experts when metadata is absent; default: 128\n");
     LOG("  --micro-d-model <n>                              default: model n_embd or 2048\n");
     LOG("  --micro-d-ff <n>                                 default: model expert FFN or 4096\n");
+    LOG("  --micro-cache-hit-rate <r>                       default: 0.5 for cache-strategy microbench\n");
     LOG("  --micro-prefill-tokens <n>                       compatibility alias for --micro-tokens <n>\n");
     LOG("  --micro-decode-tokens <n>                        default: 1 active token for decode labels\n\n");
     LOG("recommended attention placement run:\n");
@@ -284,6 +290,8 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.micro_experts_sweep = parse_i32_list(need_value("--micro-experts-sweep"));
             } else if (arg == "--micro-alpha-pcts") {
                 bench.micro_alpha_pcts = parse_i32_list(need_value("--micro-alpha-pcts"));
+            } else if (arg == "--micro-cache-hit-rate") {
+                bench.micro_cache_hit_rate = std::stod(need_value("--micro-cache-hit-rate"));
             } else if (arg == "--decode-tokens") {
                 bench.decode_tokens = std::stoi(need_value("--decode-tokens"));
             } else if (arg == "--repeats") {
@@ -326,7 +334,7 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
     }
 
     if (bench.lengths.empty() || bench.micro_tokens.empty() || bench.micro_alpha_pcts.empty() || bench.repeats <= 0 || bench.decode_tokens < 0 ||
-            bench.route_layer < 0 || bench.route_max_prompts < 0) {
+            bench.route_layer < 0 || bench.route_max_prompts < 0 || bench.micro_cache_hit_rate < 0.0 || bench.micro_cache_hit_rate > 1.0) {
         LOG_ERR("%s: invalid benchmark dimensions\n", __func__);
         return false;
     }
@@ -1493,6 +1501,44 @@ static ggml_cgraph * build_group_routed_graph(
     return gf;
 }
 
+struct expert_graph {
+    int32_t expert = 0;
+    ggml_cgraph * graph = nullptr;
+};
+
+static void build_single_expert_routed_graphs(
+        ggml_context * ctx,
+        int32_t d_model,
+        int32_t d_ff,
+        const std::vector<int32_t> & token_counts,
+        std::map<std::string, std::vector<int32_t>> & ids_overrides,
+        std::vector<expert_graph> & graphs) {
+    for (int32_t expert = 0; expert < (int32_t) token_counts.size(); ++expert) {
+        const int32_t n_tokens = token_counts[expert];
+        if (n_tokens <= 0) {
+            continue;
+        }
+
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
+        ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, 1);
+        ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, 1);
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
+        ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        const std::string ids_name = "micro_cache_strategy_ids_" + std::to_string(expert);
+        ggml_set_name(ids, ids_name.c_str());
+        ids_overrides[ids_name] = std::vector<int32_t>((size_t) n_tokens, 0);
+
+        ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
+        ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
+        ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+        ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        graphs.push_back({ expert, gf });
+    }
+}
+
 static ggml_cgraph * build_alpha_gemm_graph(
         ggml_context * ctx,
         int32_t d_model,
@@ -1702,6 +1748,216 @@ static int64_t pipeline_total_us(
     }
 
     return compute_done_us;
+}
+
+static std::vector<int64_t> aligned_load_times(
+        const std::vector<expert_graph> & graphs,
+        const std::vector<int64_t> & miss_load_us,
+        int32_t hit_experts) {
+    std::vector<int64_t> out;
+    out.reserve(graphs.size());
+    size_t miss_idx = 0;
+    for (const expert_graph & item : graphs) {
+        if (item.expert < hit_experts) {
+            out.push_back(0);
+        } else {
+            out.push_back(miss_idx < miss_load_us.size() ? miss_load_us[miss_idx++] : 0);
+        }
+    }
+    return out;
+}
+
+static void push_cache_strategy_record(
+        std::vector<micro_record> & out,
+        const std::string & strategy,
+        const std::string & phase,
+        int32_t label_tokens,
+        int32_t active_tokens,
+        int32_t active_experts,
+        int32_t cache_hit_pct,
+        int32_t hit_experts,
+        int32_t miss_experts,
+        int32_t sample,
+        int32_t rep,
+        int64_t total_us,
+        uint64_t bytes,
+        int64_t group_compute_us,
+        int64_t serial_compute_us,
+        int64_t weight_load_us,
+        int64_t pipeline_bubble_us) {
+    micro_record rec;
+    rec.kind = "moe_gemm_cache_strategy";
+    rec.phase = phase;
+    rec.tokens = label_tokens;
+    rec.active_tokens = active_tokens;
+    rec.experts = active_experts;
+    rec.group_experts = hit_experts;
+    rec.serial_experts = miss_experts;
+    rec.active_experts = active_experts;
+    rec.sample = sample;
+    rec.repeat = rep;
+    rec.time_us = total_us;
+    rec.bytes = bytes;
+    rec.group_compute_us = group_compute_us;
+    rec.serial_compute_us = serial_compute_us;
+    rec.weight_load_us = weight_load_us;
+    rec.pipeline_bubble_us = pipeline_bubble_us;
+    rec.cache_hit_pct = cache_hit_pct;
+    rec.hit_experts = hit_experts;
+    rec.miss_experts = miss_experts;
+    rec.strategy = strategy;
+    out.push_back(std::move(rec));
+}
+
+static bool run_one_cache_strategy_micro(
+        ggml_backend_dev_t dev,
+        ggml_backend_t backend,
+        const std::string & phase,
+        int32_t label_tokens,
+        int32_t sample,
+        const std::vector<int32_t> & token_counts,
+        const bench_params & bench,
+        const model_info & info,
+        std::vector<micro_record> & out) {
+    const int32_t d_model = info.n_embd > 0 ? info.n_embd : bench.micro_d_model;
+    const int32_t d_ff = info.n_ff_exp > 0 ? info.n_ff_exp : bench.micro_d_ff;
+    const int32_t active_experts = (int32_t) token_counts.size();
+    const int32_t hit_experts = (int32_t) std::floor(active_experts * bench.micro_cache_hit_rate);
+    const int32_t miss_experts = active_experts - hit_experts;
+    const int32_t cache_hit_pct = (int32_t) std::lround(bench.micro_cache_hit_rate * 100.0);
+    const int32_t active_tokens = std::accumulate(token_counts.begin(), token_counts.end(), 0);
+
+    if (active_experts <= 0 || active_tokens <= 0) {
+        return true;
+    }
+
+    const size_t mem_size = 256ULL*1024ULL*1024ULL;
+    ggml_init_params init_params = {
+        /* .mem_size   = */ mem_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    std::map<std::string, std::vector<int32_t>> ids_overrides;
+    std::vector<expert_graph> serial_graphs;
+    ggml_context * ctx = ggml_init(init_params);
+    ggml_cgraph * hit_group_gf = build_group_routed_graph(ctx, d_model, d_ff, hit_experts, token_counts, ids_overrides);
+    ggml_cgraph * all_group_gf = build_group_routed_graph(ctx, d_model, d_ff, active_experts, token_counts, ids_overrides);
+    build_single_expert_routed_graphs(ctx, d_model, d_ff, token_counts, ids_overrides, serial_graphs);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        LOG_WRN("%s: failed to allocate cache-strategy tensors for %s\n", __func__, phase.c_str());
+        ggml_free(ctx);
+        return true;
+    }
+
+    fill_graph_inputs(ctx, ids_overrides.empty() ? nullptr : &ids_overrides);
+
+    int64_t warmup_time_us = 0;
+    if (!measure_graph_us(backend, hit_group_gf, warmup_time_us) ||
+            !measure_graph_us(backend, all_group_gf, warmup_time_us)) {
+        LOG_WRN("%s: group warmup failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return true;
+    }
+    for (const expert_graph & item : serial_graphs) {
+        if (!measure_graph_us(backend, item.graph, warmup_time_us)) {
+            LOG_WRN("%s: serial warmup failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        }
+    }
+
+    expert_h2d_state h2d_state;
+    const bool h2d_ready = miss_experts <= 0 || init_expert_h2d_state(dev, backend, bench, info, h2d_state);
+    if (!h2d_ready) {
+        free_expert_h2d_state(h2d_state);
+        LOG_WRN("%s: failed to initialize expert H2D state for %s cache%d; weight load time will be zero\n", __func__, phase.c_str(), cache_hit_pct);
+    } else if (miss_experts > 0) {
+        measure_expert_h2d_us(backend, h2d_state);
+    }
+
+    for (int32_t rep = 0; rep < bench.repeats; ++rep) {
+        int64_t hit_group_compute_us = 0;
+        int64_t all_group_compute_us = 0;
+        if (!measure_graph_us(backend, hit_group_gf, hit_group_compute_us) ||
+                !measure_graph_us(backend, all_group_gf, all_group_compute_us)) {
+            LOG_WRN("%s: group compute failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
+            break;
+        }
+
+        std::vector<int64_t> serial_compute_us;
+        serial_compute_us.reserve(serial_graphs.size());
+        for (const expert_graph & item : serial_graphs) {
+            int64_t expert_compute_us = 0;
+            if (!measure_graph_us(backend, item.graph, expert_compute_us)) {
+                LOG_WRN("%s: serial compute failed for %s cache%d\n", __func__, phase.c_str(), cache_hit_pct);
+                expert_compute_us = 0;
+            }
+            serial_compute_us.push_back(expert_compute_us);
+        }
+
+        std::vector<int64_t> miss_load_us;
+        miss_load_us.reserve(serial_graphs.size());
+        for (const expert_graph & item : serial_graphs) {
+            if (item.expert >= hit_experts) {
+                miss_load_us.push_back(h2d_ready && miss_experts > 0 ? (int64_t) measure_expert_h2d_us(backend, h2d_state) : 0);
+            }
+        }
+
+        const std::vector<int64_t> miss_serial_compute_us = [&]() {
+            std::vector<int64_t> values;
+            for (size_t i = 0; i < serial_graphs.size(); ++i) {
+                if (serial_graphs[i].expert >= hit_experts) {
+                    values.push_back(serial_compute_us[i]);
+                }
+            }
+            return values;
+        }();
+
+        const uint64_t weight_load_bytes = h2d_ready ? h2d_state.bytes * (uint64_t) miss_load_us.size() : 0;
+
+        int64_t serial_total_us = 0;
+        int64_t weight_load_total_us = 0;
+        int64_t bubble_us = 0;
+        const int64_t serial_pipeline_us = pipeline_total_us(
+                0,
+                serial_compute_us,
+                aligned_load_times(serial_graphs, miss_load_us, hit_experts),
+                serial_total_us,
+                weight_load_total_us,
+                bubble_us);
+        push_cache_strategy_record(out, "serial_pipeline", phase, label_tokens, active_tokens, active_experts,
+                cache_hit_pct, hit_experts, miss_experts, sample, rep, serial_pipeline_us, weight_load_bytes,
+                0, serial_total_us, weight_load_total_us, bubble_us);
+
+        const int64_t group_wait_us = weight_load_total_us + all_group_compute_us;
+        push_cache_strategy_record(out, "group_wait", phase, label_tokens, active_tokens, active_experts,
+                cache_hit_pct, hit_experts, miss_experts, sample, rep, group_wait_us, weight_load_bytes,
+                all_group_compute_us, 0, weight_load_total_us, 0);
+
+        int64_t miss_serial_total_us = 0;
+        int64_t hybrid_weight_load_total_us = 0;
+        int64_t hybrid_bubble_us = 0;
+        const int64_t hybrid_pipeline_us = pipeline_total_us(
+                hit_group_compute_us,
+                miss_serial_compute_us,
+                miss_load_us,
+                miss_serial_total_us,
+                hybrid_weight_load_total_us,
+                hybrid_bubble_us);
+        push_cache_strategy_record(out, "hybrid_pipeline", phase, label_tokens, active_tokens, active_experts,
+                cache_hit_pct, hit_experts, miss_experts, sample, rep, hybrid_pipeline_us, weight_load_bytes,
+                hit_group_compute_us, miss_serial_total_us, hybrid_weight_load_total_us, hybrid_bubble_us);
+    }
+
+    free_expert_h2d_state(h2d_state);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
 }
 
 static bool run_one_alpha_gemm_micro(
@@ -1924,6 +2180,44 @@ static bool run_gemm_microbench(
 
     const int32_t prefill_experts = info.n_expert > 0 ? info.n_expert : bench.micro_experts;
     const int32_t decode_experts = 8;
+    if (!routes.empty()) {
+        for (const route_record & route : routes) {
+            run_one_cache_strategy_micro(
+                    dev,
+                    backend,
+                    "prefill",
+                    route.seq_len,
+                    route.sample,
+                    route_counts_i32(route),
+                    bench,
+                    info,
+                    out);
+        }
+    } else {
+        for (const int32_t tokens : bench.micro_tokens) {
+            run_one_cache_strategy_micro(
+                    dev,
+                    backend,
+                    "prefill",
+                    tokens,
+                    -1,
+                    make_prefill_token_counts(tokens, prefill_experts),
+                    bench,
+                    info,
+                    out);
+        }
+    }
+    run_one_cache_strategy_micro(
+            dev,
+            backend,
+            "decode",
+            bench.micro_decode_tokens,
+            -1,
+            make_decode_token_counts(decode_experts),
+            bench,
+            info,
+            out);
+
     for (const int32_t alpha_pct : bench.micro_alpha_pcts) {
         if (!routes.empty()) {
             for (const route_record & route : routes) {
@@ -2018,6 +2312,10 @@ static void write_raw_jsonl(
               << ",\"group_experts\":" << rec.group_experts
               << ",\"serial_experts\":" << rec.serial_experts
               << ",\"active_experts\":" << rec.active_experts
+              << ",\"cache_hit_rate\":" << (rec.cache_hit_pct >= 0 ? (double) rec.cache_hit_pct / 100.0 : -1.0)
+              << ",\"hit_experts\":" << rec.hit_experts
+              << ",\"miss_experts\":" << rec.miss_experts
+              << ",\"strategy\":\"" << json_escape(rec.strategy) << "\""
               << ",\"sample\":" << rec.sample
               << ",\"repeat\":" << rec.repeat
               << ",\"time_us\":" << rec.time_us
@@ -2080,7 +2378,9 @@ static void write_summary_csv(
 
     for (const auto & rec : micros) {
         std::ostringstream key;
-        if (rec.alpha_pct >= 0) {
+        if (!rec.strategy.empty() && rec.cache_hit_pct >= 0) {
+            key << rec.kind << ",micro_cache" << rec.cache_hit_pct << "_" << rec.strategy << "," << rec.phase << "," << rec.tokens << ",-1,time_us";
+        } else if (rec.alpha_pct >= 0) {
             key << rec.kind << ",micro_alpha" << rec.alpha_pct << "," << rec.phase << "," << rec.tokens << ",-1,time_us";
         } else {
             key << rec.kind << ",micro_h" << rec.experts << "," << rec.phase << "," << rec.tokens << ",-1,time_us";
@@ -2088,7 +2388,9 @@ static void write_summary_csv(
         buckets[key.str()].values.push_back((double) rec.time_us);
         if (rec.bytes > 0) {
             std::ostringstream kb;
-            if (rec.alpha_pct >= 0) {
+            if (!rec.strategy.empty() && rec.cache_hit_pct >= 0) {
+                kb << rec.kind << ",micro_cache" << rec.cache_hit_pct << "_" << rec.strategy << "," << rec.phase << "," << rec.tokens << ",-1,bytes";
+            } else if (rec.alpha_pct >= 0) {
                 kb << rec.kind << ",micro_alpha" << rec.alpha_pct << "," << rec.phase << "," << rec.tokens << ",-1,bytes";
             } else {
                 kb << rec.kind << ",micro_h" << rec.experts << "," << rec.phase << "," << rec.tokens << ",-1,bytes";
@@ -2159,6 +2461,7 @@ static void write_report(const std::filesystem::path & path, const bench_params 
         report << bench.micro_alpha_pcts[i];
     }
     report << "`\n";
+    report << "- micro cache hit rate: `" << bench.micro_cache_hit_rate << "`\n";
     report << "- micro prefill fallback experts: `" << bench.micro_experts << "`\n";
     report << "- micro decode active tokens: `" << bench.micro_decode_tokens << "`\n";
     report << "- model layers: `" << info.n_layer << "`\n";
@@ -2169,7 +2472,7 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, expert_h2d_pinned, route, and microbench records\n";
     report << "- `summary.csv`: aggregated averages and stddevs; decode attention_layer rows are per-token averages\n";
     report << "- `plots/*.svg`: generated by `plot_qwen3vl_moe_bench.py`\n\n";
-    report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving. Alpha MoE GEMM time models a compute/copy pipeline from measured components; `pipeline_bubble_us` is the uncovered expert-load wait time.\n";
+    report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving. Alpha and cache-strategy MoE GEMM time models compute/copy pipelines from measured components; `pipeline_bubble_us` is the uncovered expert-load wait time.\n";
 }
 
 int main(int argc, char ** argv) {
