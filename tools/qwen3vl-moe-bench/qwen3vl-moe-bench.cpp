@@ -1122,6 +1122,45 @@ static std::vector<ggml_fp16_t> make_f16_data(size_t n) {
     return data;
 }
 
+static void push_alpha_record(
+        std::vector<micro_record> & out,
+        const std::string & kind,
+        const std::string & phase,
+        int32_t label_tokens,
+        int32_t active_tokens,
+        int32_t active_experts,
+        int32_t alpha_pct,
+        int32_t group_experts,
+        int32_t serial_experts,
+        int32_t sample,
+        int32_t rep,
+        int64_t time_us,
+        uint64_t bytes,
+        int64_t group_compute_us = 0,
+        int64_t serial_compute_us = 0,
+        int64_t weight_load_us = 0,
+        int64_t pipeline_bubble_us = 0) {
+    micro_record rec;
+    rec.kind = kind;
+    rec.phase = phase;
+    rec.tokens = label_tokens;
+    rec.active_tokens = active_tokens;
+    rec.experts = active_experts;
+    rec.alpha_pct = alpha_pct;
+    rec.group_experts = group_experts;
+    rec.serial_experts = serial_experts;
+    rec.active_experts = active_experts;
+    rec.sample = sample;
+    rec.repeat = rep;
+    rec.time_us = time_us;
+    rec.bytes = bytes;
+    rec.group_compute_us = group_compute_us;
+    rec.serial_compute_us = serial_compute_us;
+    rec.weight_load_us = weight_load_us;
+    rec.pipeline_bubble_us = pipeline_bubble_us;
+    out.push_back(std::move(rec));
+}
+
 struct expert_h2d_state {
     ggml_context * ctx_src = nullptr;
     ggml_context * ctx_dst = nullptr;
@@ -1320,7 +1359,7 @@ static bool run_h2d_microbench(const bench_params & bench, const model_info & in
         time_us += copy_one_expert(gate_dst, gate_src, 0);
         time_us += copy_one_expert(up_dst,   up_src,   0);
         time_us += copy_one_expert(down_dst, down_src, 0);
-        out.push_back({ "expert_h2d_pinned", "copy", 0, 0, 1, -1, 0, 0, 1, -1, rep, (int64_t) time_us, full_expert_bytes() });
+        push_alpha_record(out, "expert_h2d_pinned", "copy", 0, 0, 1, -1, 0, 0, -1, rep, (int64_t) time_us, full_expert_bytes());
     }
 
     ggml_backend_buffer_free(gpu_buf);
@@ -1686,21 +1725,20 @@ static bool run_one_gemm_micro(
             LOG_WRN("%s: microbench compute failed for %s/%s\n", __func__, group ? "group" : "serial", phase.c_str());
             break;
         }
-        out.push_back({
-            group ? "moe_group_gemm" : "moe_serial_gemm",
-            phase,
-            label_tokens,
-            active_tokens,
-            experts,
-            -1,
-            group ? experts : 0,
-            group ? 0 : experts,
-            experts,
-            -1,
-            rep,
-            t1 - t0,
-            0,
-        });
+        push_alpha_record(
+                out,
+                group ? "moe_group_gemm" : "moe_serial_gemm",
+                phase,
+                label_tokens,
+                active_tokens,
+                experts,
+                -1,
+                group ? experts : 0,
+                group ? 0 : experts,
+                -1,
+                rep,
+                t1 - t0,
+                0);
     }
 
     ggml_backend_buffer_free(buf);
@@ -2065,85 +2103,17 @@ static bool run_one_alpha_gemm_micro(
                 pipeline_bubble_us);
 
         const uint64_t weight_load_bytes = h2d_ready ? h2d_state.bytes * (uint64_t) serial_graphs.size() : 0;
-        out.push_back({
-            "moe_gemm",
-            phase,
-            label_tokens,
-            active_tokens,
-            active_experts,
-            alpha_pct,
-            group_experts,
-            serial_experts,
-            active_experts,
-            sample,
-            rep,
-            total_us,
-            weight_load_bytes,
-            group_compute_us,
-            serial_compute_total_us,
-            weight_load_total_us,
-            pipeline_bubble_us,
-        });
-        out.push_back({
-            "moe_gemm_group_compute",
-            phase,
-            label_tokens,
-            active_tokens,
-            active_experts,
-            alpha_pct,
-            group_experts,
-            serial_experts,
-            active_experts,
-            sample,
-            rep,
-            group_compute_us,
-            0,
-        });
-        out.push_back({
-            "moe_gemm_serial_compute",
-            phase,
-            label_tokens,
-            active_tokens,
-            active_experts,
-            alpha_pct,
-            group_experts,
-            serial_experts,
-            active_experts,
-            sample,
-            rep,
-            serial_compute_total_us,
-            0,
-        });
-        out.push_back({
-            "moe_gemm_weight_load",
-            phase,
-            label_tokens,
-            active_tokens,
-            active_experts,
-            alpha_pct,
-            group_experts,
-            serial_experts,
-            active_experts,
-            sample,
-            rep,
-            weight_load_total_us,
-            weight_load_bytes,
-        });
-        out.push_back({
-            "moe_gemm_pipeline_bubble",
-            phase,
-            label_tokens,
-            active_tokens,
-            active_experts,
-            alpha_pct,
-            group_experts,
-            serial_experts,
-            active_experts,
-            sample,
-            rep,
-            pipeline_bubble_us,
-            0,
-        });
+        push_alpha_record(out, "moe_gemm", phase, label_tokens, active_tokens, active_experts,
+                alpha_pct, group_experts, serial_experts, sample, rep, total_us, weight_load_bytes,
+                group_compute_us, serial_compute_total_us, weight_load_total_us, pipeline_bubble_us);
+        push_alpha_record(out, "moe_gemm_group_compute", phase, label_tokens, active_tokens, active_experts,
+                alpha_pct, group_experts, serial_experts, sample, rep, group_compute_us, 0);
+        push_alpha_record(out, "moe_gemm_serial_compute", phase, label_tokens, active_tokens, active_experts,
+                alpha_pct, group_experts, serial_experts, sample, rep, serial_compute_total_us, 0);
+        push_alpha_record(out, "moe_gemm_weight_load", phase, label_tokens, active_tokens, active_experts,
+                alpha_pct, group_experts, serial_experts, sample, rep, weight_load_total_us, weight_load_bytes);
+        push_alpha_record(out, "moe_gemm_pipeline_bubble", phase, label_tokens, active_tokens, active_experts,
+                alpha_pct, group_experts, serial_experts, sample, rep, pipeline_bubble_us, 0);
     }
 
     free_expert_h2d_state(h2d_state);
