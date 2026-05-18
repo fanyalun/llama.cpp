@@ -97,6 +97,10 @@ struct micro_record {
     int32_t repeat = 0;
     int64_t time_us = 0;
     uint64_t bytes = 0;
+    int64_t group_compute_us = 0;
+    int64_t serial_compute_us = 0;
+    int64_t weight_load_us = 0;
+    int64_t pipeline_bubble_us = 0;
 };
 
 struct route_record {
@@ -1110,6 +1114,113 @@ static std::vector<ggml_fp16_t> make_f16_data(size_t n) {
     return data;
 }
 
+struct expert_h2d_state {
+    ggml_context * ctx_src = nullptr;
+    ggml_context * ctx_dst = nullptr;
+    ggml_backend_buffer_t host_buf = nullptr;
+    ggml_backend_buffer_t gpu_buf = nullptr;
+    ggml_tensor * gate_src = nullptr;
+    ggml_tensor * up_src = nullptr;
+    ggml_tensor * down_src = nullptr;
+    ggml_tensor * gate_dst = nullptr;
+    ggml_tensor * up_dst = nullptr;
+    ggml_tensor * down_dst = nullptr;
+    int32_t n_experts = 2;
+    uint64_t bytes = 0;
+};
+
+static size_t expert_tensor_copy_size(const ggml_tensor * t, int32_t expert_id, int32_t n_experts) {
+    const size_t expert_size = t->nb[2];
+    const size_t padding = std::min<size_t>(expert_size, 512);
+    const size_t padding_end = expert_id < n_experts - 1 ? padding : 0;
+    return expert_size + padding_end;
+}
+
+static uint64_t expert_h2d_bytes(const bench_params & bench, const expert_h2d_state & state) {
+    if (bench.expert_bytes > 0) {
+        return (uint64_t) bench.expert_bytes;
+    }
+    uint64_t bytes = 0;
+    for (ggml_tensor * t : { state.gate_src, state.up_src, state.down_src }) {
+        bytes += expert_tensor_copy_size(t, 0, state.n_experts);
+    }
+    return bytes;
+}
+
+static bool init_expert_h2d_state(
+        ggml_backend_dev_t dev,
+        ggml_backend_t backend,
+        const bench_params & bench,
+        const model_info & info,
+        expert_h2d_state & state) {
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (host_buft == nullptr) {
+        return false;
+    }
+
+    const int32_t d_model = info.n_embd > 0 ? info.n_embd : bench.micro_d_model;
+    const int32_t d_ff = info.n_ff_exp > 0 ? info.n_ff_exp : bench.micro_d_ff;
+
+    ggml_init_params init_params = {
+        /* .mem_size   = */ 6*ggml_tensor_overhead() + 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    state.ctx_src = ggml_init(init_params);
+    state.ctx_dst = ggml_init(init_params);
+    state.gate_src = ggml_new_tensor_3d(state.ctx_src, GGML_TYPE_F16, d_model, d_ff, state.n_experts);
+    state.up_src   = ggml_new_tensor_3d(state.ctx_src, GGML_TYPE_F16, d_model, d_ff, state.n_experts);
+    state.down_src = ggml_new_tensor_3d(state.ctx_src, GGML_TYPE_F16, d_ff, d_model, state.n_experts);
+    state.gate_dst = ggml_new_tensor_3d(state.ctx_dst, GGML_TYPE_F16, d_model, d_ff, state.n_experts);
+    state.up_dst   = ggml_new_tensor_3d(state.ctx_dst, GGML_TYPE_F16, d_model, d_ff, state.n_experts);
+    state.down_dst = ggml_new_tensor_3d(state.ctx_dst, GGML_TYPE_F16, d_ff, d_model, state.n_experts);
+
+    state.host_buf = ggml_backend_alloc_ctx_tensors_from_buft(state.ctx_src, host_buft);
+    if (state.host_buf == nullptr) {
+        return false;
+    }
+    state.gpu_buf = ggml_backend_alloc_ctx_tensors(state.ctx_dst, backend);
+    if (state.gpu_buf == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_clear(state.host_buf, 0x7f);
+    state.bytes = expert_h2d_bytes(bench, state);
+    return true;
+}
+
+static void free_expert_h2d_state(expert_h2d_state & state) {
+    if (state.gpu_buf) {
+        ggml_backend_buffer_free(state.gpu_buf);
+    }
+    if (state.host_buf) {
+        ggml_backend_buffer_free(state.host_buf);
+    }
+    if (state.ctx_dst) {
+        ggml_free(state.ctx_dst);
+    }
+    if (state.ctx_src) {
+        ggml_free(state.ctx_src);
+    }
+    state = {};
+}
+
+static uint64_t measure_expert_h2d_us(ggml_backend_t backend, const expert_h2d_state & state) {
+    auto copy_tensor = [&](ggml_tensor * dst, ggml_tensor * src) {
+        const size_t expert_offset = 0;
+        const size_t copy_size = expert_tensor_copy_size(src, 0, state.n_experts);
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + expert_offset, expert_offset, copy_size);
+    };
+
+    const int64_t t0 = ggml_time_us();
+    copy_tensor(state.gate_dst, state.gate_src);
+    copy_tensor(state.up_dst,   state.up_src);
+    copy_tensor(state.down_dst, state.down_src);
+    ggml_backend_synchronize(backend);
+    const int64_t t1 = ggml_time_us();
+    return (uint64_t) (t1 - t0);
+}
+
 static bool run_h2d_microbench(const bench_params & bench, const model_info & info, std::vector<micro_record> & out) {
     ggml_backend_dev_t dev = first_gpu_device();
     if (dev == nullptr) {
@@ -1325,6 +1436,63 @@ static void build_serial_routed_paths(
     }
 }
 
+static void build_serial_routed_graphs(
+        ggml_context * ctx,
+        int32_t d_model,
+        int32_t d_ff,
+        int32_t first_expert,
+        const std::vector<int32_t> & token_counts,
+        std::map<std::string, std::vector<int32_t>> & ids_overrides,
+        std::vector<ggml_cgraph *> & graphs) {
+    const int32_t serial_experts = (int32_t) token_counts.size() - first_expert;
+    if (serial_experts <= 0) {
+        return;
+    }
+
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, serial_experts);
+    ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_model, d_ff, serial_experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d_ff, d_model, serial_experts);
+
+    for (int32_t expert = first_expert; expert < (int32_t) token_counts.size(); ++expert) {
+        const int32_t n_tokens = token_counts[expert];
+        if (n_tokens <= 0) {
+            continue;
+        }
+
+        const int32_t local = expert - first_expert;
+        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, n_tokens);
+        ggml_tensor * ids    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        const std::string ids_name = "micro_pipeline_serial_ids_" + std::to_string(expert);
+        ggml_set_name(ids, ids_name.c_str());
+        ids_overrides[ids_name] = std::vector<int32_t>((size_t) n_tokens, local);
+
+        ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate, x, ids);
+        ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, up,   x, ids);
+        ggml_tensor * act      = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+        ggml_tensor * y        = ggml_mul_mat_id(ctx, down, act, ids);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        graphs.push_back(gf);
+    }
+}
+
+static ggml_cgraph * build_group_routed_graph(
+        ggml_context * ctx,
+        int32_t d_model,
+        int32_t d_ff,
+        int32_t group_experts,
+        const std::vector<int32_t> & token_counts,
+        std::map<std::string, std::vector<int32_t>> & ids_overrides) {
+    ggml_tensor * y_group = build_group_routed_path(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides);
+    if (y_group == nullptr) {
+        return nullptr;
+    }
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y_group);
+    return gf;
+}
+
 static ggml_cgraph * build_alpha_gemm_graph(
         ggml_context * ctx,
         int32_t d_model,
@@ -1494,7 +1662,50 @@ static bool run_one_gemm_micro(
     return true;
 }
 
+static bool measure_graph_us(ggml_backend_t backend, ggml_cgraph * gf, int64_t & time_us) {
+    if (gf == nullptr) {
+        time_us = 0;
+        return true;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+    const int64_t t1 = ggml_time_us();
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    time_us = t1 - t0;
+    return true;
+}
+
+static int64_t pipeline_total_us(
+        int64_t group_compute_us,
+        const std::vector<int64_t> & serial_compute_us,
+        const std::vector<int64_t> & weight_load_us,
+        int64_t & serial_total_us,
+        int64_t & load_total_us,
+        int64_t & bubble_us) {
+    serial_total_us = std::accumulate(serial_compute_us.begin(), serial_compute_us.end(), (int64_t) 0);
+    load_total_us = std::accumulate(weight_load_us.begin(), weight_load_us.end(), (int64_t) 0);
+    bubble_us = 0;
+
+    int64_t copy_done_us = 0;
+    int64_t compute_done_us = group_compute_us;
+    for (size_t i = 0; i < serial_compute_us.size(); ++i) {
+        copy_done_us += i < weight_load_us.size() ? weight_load_us[i] : 0;
+        if (copy_done_us > compute_done_us) {
+            bubble_us += copy_done_us - compute_done_us;
+            compute_done_us = copy_done_us;
+        }
+        compute_done_us += serial_compute_us[i];
+    }
+
+    return compute_done_us;
+}
+
 static bool run_one_alpha_gemm_micro(
+        ggml_backend_dev_t dev,
         ggml_backend_t backend,
         const std::string & phase,
         int32_t label_tokens,
@@ -1523,8 +1734,10 @@ static bool run_one_alpha_gemm_micro(
     };
 
     std::map<std::string, std::vector<int32_t>> ids_overrides;
+    std::vector<ggml_cgraph *> serial_graphs;
     ggml_context * ctx = ggml_init(init_params);
-    ggml_cgraph * gf = build_alpha_gemm_graph(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides);
+    ggml_cgraph * group_gf = build_group_routed_graph(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides);
+    build_serial_routed_graphs(ctx, d_model, d_ff, group_experts, token_counts, ids_overrides, serial_graphs);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (buf == nullptr) {
@@ -1535,22 +1748,67 @@ static bool run_one_alpha_gemm_micro(
 
     fill_graph_inputs(ctx, ids_overrides.empty() ? nullptr : &ids_overrides);
 
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+    int64_t warmup_time_us = 0;
+    if (!measure_graph_us(backend, group_gf, warmup_time_us)) {
         LOG_WRN("%s: warmup failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return true;
     }
+    for (ggml_cgraph * gf : serial_graphs) {
+        if (!measure_graph_us(backend, gf, warmup_time_us)) {
+            LOG_WRN("%s: serial warmup failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        }
+    }
+
+    expert_h2d_state h2d_state;
+    const bool h2d_ready = serial_experts <= 0 || init_expert_h2d_state(dev, backend, bench, info, h2d_state);
+    if (!h2d_ready) {
+        free_expert_h2d_state(h2d_state);
+        LOG_WRN("%s: failed to initialize expert H2D state for %s/alpha%d; weight load time will be zero\n", __func__, phase.c_str(), alpha_pct);
+    } else if (serial_experts > 0) {
+        measure_expert_h2d_us(backend, h2d_state);
+    }
 
     for (int32_t rep = 0; rep < bench.repeats; ++rep) {
-        const int64_t t0 = ggml_time_us();
-        const enum ggml_status status = ggml_backend_graph_compute(backend, gf);
-        ggml_backend_synchronize(backend);
-        const int64_t t1 = ggml_time_us();
-        if (status != GGML_STATUS_SUCCESS) {
-            LOG_WRN("%s: microbench compute failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
+        int64_t group_compute_us = 0;
+        if (!measure_graph_us(backend, group_gf, group_compute_us)) {
+            LOG_WRN("%s: group compute failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
             break;
         }
+
+        std::vector<int64_t> serial_compute_us;
+        serial_compute_us.reserve(serial_graphs.size());
+        for (ggml_cgraph * gf : serial_graphs) {
+            int64_t expert_compute_us = 0;
+            if (!measure_graph_us(backend, gf, expert_compute_us)) {
+                LOG_WRN("%s: serial compute failed for %s/alpha%d\n", __func__, phase.c_str(), alpha_pct);
+                expert_compute_us = 0;
+            }
+            serial_compute_us.push_back(expert_compute_us);
+        }
+
+        std::vector<int64_t> weight_load_us;
+        weight_load_us.reserve(serial_graphs.size());
+        for (size_t i = 0; i < serial_graphs.size(); ++i) {
+            weight_load_us.push_back(h2d_ready && serial_experts > 0 ? (int64_t) measure_expert_h2d_us(backend, h2d_state) : 0);
+        }
+
+        int64_t serial_compute_total_us = 0;
+        int64_t weight_load_total_us = 0;
+        int64_t pipeline_bubble_us = 0;
+        const int64_t total_us = pipeline_total_us(
+                group_compute_us,
+                serial_compute_us,
+                weight_load_us,
+                serial_compute_total_us,
+                weight_load_total_us,
+                pipeline_bubble_us);
+
+        const uint64_t weight_load_bytes = h2d_ready ? h2d_state.bytes * (uint64_t) serial_graphs.size() : 0;
         out.push_back({
             "moe_gemm",
             phase,
@@ -1563,11 +1821,76 @@ static bool run_one_alpha_gemm_micro(
             active_experts,
             sample,
             rep,
-            t1 - t0,
+            total_us,
+            weight_load_bytes,
+            group_compute_us,
+            serial_compute_total_us,
+            weight_load_total_us,
+            pipeline_bubble_us,
+        });
+        out.push_back({
+            "moe_gemm_group_compute",
+            phase,
+            label_tokens,
+            active_tokens,
+            active_experts,
+            alpha_pct,
+            group_experts,
+            serial_experts,
+            active_experts,
+            sample,
+            rep,
+            group_compute_us,
+            0,
+        });
+        out.push_back({
+            "moe_gemm_serial_compute",
+            phase,
+            label_tokens,
+            active_tokens,
+            active_experts,
+            alpha_pct,
+            group_experts,
+            serial_experts,
+            active_experts,
+            sample,
+            rep,
+            serial_compute_total_us,
+            0,
+        });
+        out.push_back({
+            "moe_gemm_weight_load",
+            phase,
+            label_tokens,
+            active_tokens,
+            active_experts,
+            alpha_pct,
+            group_experts,
+            serial_experts,
+            active_experts,
+            sample,
+            rep,
+            weight_load_total_us,
+            weight_load_bytes,
+        });
+        out.push_back({
+            "moe_gemm_pipeline_bubble",
+            phase,
+            label_tokens,
+            active_tokens,
+            active_experts,
+            alpha_pct,
+            group_experts,
+            serial_experts,
+            active_experts,
+            sample,
+            rep,
+            pipeline_bubble_us,
             0,
         });
     }
 
+    free_expert_h2d_state(h2d_state);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return true;
@@ -1605,6 +1928,7 @@ static bool run_gemm_microbench(
         if (!routes.empty()) {
             for (const route_record & route : routes) {
                 run_one_alpha_gemm_micro(
+                        dev,
                         backend,
                         "prefill",
                         route.seq_len,
@@ -1618,6 +1942,7 @@ static bool run_gemm_microbench(
         } else {
             for (const int32_t tokens : bench.micro_tokens) {
                 run_one_alpha_gemm_micro(
+                        dev,
                         backend,
                         "prefill",
                         tokens,
@@ -1630,6 +1955,7 @@ static bool run_gemm_microbench(
             }
         }
         run_one_alpha_gemm_micro(
+                dev,
                 backend,
                 "decode",
                 bench.micro_decode_tokens,
@@ -1696,6 +2022,10 @@ static void write_raw_jsonl(
               << ",\"repeat\":" << rec.repeat
               << ",\"time_us\":" << rec.time_us
               << ",\"bytes\":" << rec.bytes
+              << ",\"group_compute_us\":" << rec.group_compute_us
+              << ",\"serial_compute_us\":" << rec.serial_compute_us
+              << ",\"weight_load_us\":" << rec.weight_load_us
+              << ",\"pipeline_bubble_us\":" << rec.pipeline_bubble_us
               << "}\n";
     }
 }
@@ -1836,10 +2166,10 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- experts: `" << info.n_expert << "`\n";
     report << "- expert FFN: `" << info.n_ff_exp << "`\n\n";
     report << "## Outputs\n\n";
-    report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, expert_h2d_pinned, and microbench records\n";
+    report << "- `results.jsonl`: raw node, attention_kv_h2d, attention-layer, runtime MoE-copy, expert_h2d_pinned, route, and microbench records\n";
     report << "- `summary.csv`: aggregated averages and stddevs; decode attention_layer rows are per-token averages\n";
     report << "- `plots/*.svg`: generated by `plot_qwen3vl_moe_bench.py`\n\n";
-    report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving.\n";
+    report << "Note: runtime MoE-copy and CPU-KV-to-GPU-attention profiling synchronize the destination backend around measured copies, so they are for measurement rather than maximum-throughput serving. Alpha MoE GEMM time models a compute/copy pipeline from measured components; `pipeline_bubble_us` is the uncovered expert-load wait time.\n";
 }
 
 int main(int argc, char ** argv) {

@@ -99,13 +99,16 @@ Measure the Alpha MoE GEMM sweep without rerunning the model benchmark:
   --out-dir results/qwen3vl_moe_gemm
 ```
 
-The Alpha sweep uses `ggml_mul_mat_id` on both sides of the split. The prefix
-experts selected by `alpha` are measured as one routed `mul_mat_id` path with
-multiple expert ids, while the remaining suffix experts are measured by
-looping over experts and calling `mul_mat_id` once per expert with a single
-expert id. This keeps the comparison focused on routed-MoE grouping versus
-per-expert routed execution, rather than comparing `mul_mat_id` against plain
-`ggml_mul_mat`.
+The Alpha sweep treats `alpha` as the expert-cache hit rate. Prefix experts by
+expert id are assumed to already be resident on the GPU and are computed as one
+routed `ggml_mul_mat_id` group. The remaining suffix experts are cache misses:
+the benchmark measures one pinned-host-to-GPU full-expert weight load per miss
+and one serial `ggml_mul_mat_id` compute per miss, then models a two-stream
+pipeline where expert loads overlap with compute. The reported `moe_gemm`
+`time_us` is the simulated pipeline makespan, including uncovered load bubbles.
+Additional summary rows expose `moe_gemm_group_compute`,
+`moe_gemm_serial_compute`, `moe_gemm_weight_load`, and
+`moe_gemm_pipeline_bubble`.
 
 Measure the Alpha MoE GEMM sweep with real layer-10 token-to-expert routing
 from the AIME allresults JSON:
@@ -134,9 +137,10 @@ different prompt offset. Use `--route-max-prompts 0` to collect one packed sampl
 starting at every prompt for each length.
 
 The Alpha sweep splits active experts by expert id order. The first
-`floor(active_experts * alpha / 100)` experts use Group GEMM, and the remaining
-experts use Serial GEMM. Prefill uses the model expert count as active experts
-and distributes input tokens with a fixed `N,N-1,...,1` long-tail weight after
+`floor(active_experts * alpha / 100)` experts are treated as cache hits, and the
+remaining experts are treated as cache misses whose weight loads are pipelined
+with compute. Prefill uses the model expert count as active experts and
+distributes input tokens with a fixed `N,N-1,...,1` long-tail weight after
 assigning one token per expert. Decode uses one token with Top-K `8` active
 experts and records one row per alpha.
 
@@ -152,7 +156,7 @@ python3 tools/qwen3vl-moe-bench/plot_qwen3vl_moe_bench.py \
 
 Outputs:
 
-- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, route distributions, and microbench records. Alpha GEMM records include `alpha_pct`, `group_experts`, `serial_experts`, and `active_experts`.
+- `results.jsonl`: raw node timings, `attention_kv_h2d` records, per-layer attention summaries, runtime MoE copy records, `expert_h2d_pinned` records, route distributions, and microbench records. Alpha GEMM records include `alpha_pct`, `group_experts`, `serial_experts`, `active_experts`, `group_compute_us`, `serial_compute_us`, `weight_load_us`, and `pipeline_bubble_us`.
 - `summary.csv`: aggregated averages and standard deviations. Decode `attention_layer` rows are per-token averages. Alpha GEMM rows use `mode=micro_alphaN`.
 - `plots/figure1_attention_time.svg`: prefill/decode average per-layer Attention time.
 - `plots/figure2_attention_expert_copy_ratio.svg`: `KV CPU + Attn CPU` average per-layer Attention time divided by one routed expert pinned H2D copy time.
