@@ -34,6 +34,7 @@ struct bench_params {
     std::string attention_placement = "kv_gpu_attn_gpu";
     std::string out_dir = "qwen3vl_moe_bench_results";
     std::string prompt_json;
+    std::string route_jsonl;
     std::vector<int32_t> lengths = { 1024, 4096, 8192, 16384 };
     std::vector<int32_t> micro_tokens = { 1024, 2048, 4096, 8192, 16384, 32768 };
     std::vector<int32_t> micro_experts_sweep = { 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -219,6 +220,7 @@ static void print_usage(const char * argv0) {
     LOG("  --attention-backend <cpu|gpu>                     compatibility alias for kv_cpu_attn_cpu / kv_gpu_attn_gpu\n");
     LOG("  --out-dir <dir>                                  default: qwen3vl_moe_bench_results\n");
     LOG("  --prompt-json <path>                             collect real layer routes from AIME/OpenAI allresults JSON\n");
+    LOG("  --route-jsonl <path>                             reuse moe_route_distribution rows from a previous results.jsonl\n");
     LOG("  --route-layer <n>                                0-based layer id for token2expert collection; default: 10\n");
     LOG("  --route-max-prompts <n>                          max prompts per length for route collection; 0 means all; default: 16\n");
     LOG("  --lengths <csv>                                  default: 1024,4096,8192,16384\n");
@@ -278,6 +280,8 @@ static bool parse_custom_args(int argc, char ** argv, bench_params & bench, std:
                 bench.out_dir = need_value("--out-dir");
             } else if (arg == "--prompt-json") {
                 bench.prompt_json = need_value("--prompt-json");
+            } else if (arg == "--route-jsonl") {
+                bench.route_jsonl = need_value("--route-jsonl");
             } else if (arg == "--route-layer") {
                 bench.route_layer = std::stoi(need_value("--route-layer"));
             } else if (arg == "--route-max-prompts") {
@@ -454,23 +458,32 @@ static bool eval_callback(ggml_tensor * t, bool ask, void * user_data) {
 
     if (route_target && t->type == GGML_TYPE_I32) {
         const size_t n_bytes = ggml_nbytes(t);
-        const int32_t * ids = nullptr;
+        const uint8_t * data = nullptr;
         if (ggml_backend_buffer_is_host(t->buffer)) {
-            ids = (const int32_t *) t->data;
+            data = (const uint8_t *) t->data;
         } else {
             cb->route_data.resize(n_bytes);
             ggml_backend_tensor_get(t, cb->route_data.data(), 0, n_bytes);
-            ids = (const int32_t *) cb->route_data.data();
+            data = cb->route_data.data();
         }
 
-        const size_t n_ids = n_bytes / sizeof(int32_t);
-        for (size_t i = 0; i < n_ids; ++i) {
-            const int32_t expert = ids[i];
-            if (expert >= 0) {
-                if ((size_t) expert >= cb->route_counts->size()) {
-                    cb->route_counts->resize((size_t) expert + 1, 0);
+        if (data != nullptr) {
+            // ffn_moe_topk is a strided view of argsort output; count only logical top-k elements.
+            for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const size_t offset = (size_t) (i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3]);
+                            const int32_t expert = *(const int32_t *) (data + offset);
+                            if (expert >= 0) {
+                                if ((size_t) expert >= cb->route_counts->size()) {
+                                    cb->route_counts->resize((size_t) expert + 1, 0);
+                                }
+                                (*cb->route_counts)[(size_t) expert]++;
+                            }
+                        }
+                    }
                 }
-                (*cb->route_counts)[(size_t) expert]++;
             }
         }
     }
@@ -701,6 +714,135 @@ static std::vector<std::string> load_aime_prompt_json(const std::string & path) 
 
     LOG_INF("%s: loaded %zu prompt(s) from %s\n", __func__, prompts.size(), path.c_str());
     return prompts;
+}
+
+static bool json_line_has_string(const std::string & line, const std::string & key, const std::string & value) {
+    const std::string needle = "\"" + key + "\":\"" + value + "\"";
+    return line.find(needle) != std::string::npos;
+}
+
+static bool json_line_i64(const std::string & line, const std::string & key, int64_t & out) {
+    const std::string needle = "\"" + key + "\":";
+    size_t pos = line.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += needle.size();
+    while (pos < line.size() && std::isspace((unsigned char) line[pos])) {
+        pos++;
+    }
+    size_t end = pos;
+    if (end < line.size() && line[end] == '-') {
+        end++;
+    }
+    while (end < line.size() && std::isdigit((unsigned char) line[end])) {
+        end++;
+    }
+    if (end == pos || (end == pos + 1 && line[pos] == '-')) {
+        return false;
+    }
+    out = std::stoll(line.substr(pos, end - pos));
+    return true;
+}
+
+static bool json_line_i64_array(const std::string & line, const std::string & key, std::vector<int64_t> & out) {
+    const std::string needle = "\"" + key + "\":[";
+    size_t pos = line.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += needle.size();
+    const size_t end = line.find(']', pos);
+    if (end == std::string::npos) {
+        return false;
+    }
+
+    out.clear();
+    while (pos < end) {
+        while (pos < end && (std::isspace((unsigned char) line[pos]) || line[pos] == ',')) {
+            pos++;
+        }
+        if (pos >= end) {
+            break;
+        }
+        size_t next = pos;
+        if (next < end && line[next] == '-') {
+            next++;
+        }
+        while (next < end && std::isdigit((unsigned char) line[next])) {
+            next++;
+        }
+        if (next == pos || (next == pos + 1 && line[pos] == '-')) {
+            return false;
+        }
+        out.push_back(std::stoll(line.substr(pos, next - pos)));
+        pos = next;
+    }
+    return true;
+}
+
+static bool load_route_distributions_jsonl(
+        const bench_params & bench,
+        std::vector<route_record> & routes,
+        model_info & info) {
+    if (bench.route_jsonl.empty()) {
+        return true;
+    }
+
+    std::ifstream in(bench.route_jsonl);
+    if (!in) {
+        LOG_ERR("%s: failed to open route JSONL '%s'\n", __func__, bench.route_jsonl.c_str());
+        return false;
+    }
+
+    const std::set<int32_t> wanted_lengths(bench.micro_tokens.begin(), bench.micro_tokens.end());
+    std::map<int32_t, int32_t> loaded_per_length;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!json_line_has_string(line, "kind", "moe_route_distribution")) {
+            continue;
+        }
+
+        int64_t seq_len = 0;
+        int64_t sample = 0;
+        int64_t layer = -1;
+        std::vector<int64_t> counts;
+        if (!json_line_i64(line, "seq_len", seq_len) ||
+                !json_line_i64(line, "sample", sample) ||
+                !json_line_i64(line, "layer", layer) ||
+                !json_line_i64_array(line, "expert_counts", counts)) {
+            LOG_WRN("%s: skipping malformed route row in %s\n", __func__, bench.route_jsonl.c_str());
+            continue;
+        }
+        if (!wanted_lengths.empty() && wanted_lengths.find((int32_t) seq_len) == wanted_lengths.end()) {
+            continue;
+        }
+        if ((int32_t) layer != bench.route_layer) {
+            continue;
+        }
+        if (bench.route_max_prompts > 0 && loaded_per_length[(int32_t) seq_len] >= bench.route_max_prompts) {
+            continue;
+        }
+
+        int64_t original_tokens = seq_len;
+        int64_t packed_prompts = 0;
+        json_line_i64(line, "original_tokens", original_tokens);
+        json_line_i64(line, "packed_prompts", packed_prompts);
+
+        routes.push_back({
+            (int32_t) seq_len,
+            (int32_t) sample,
+            (int32_t) original_tokens,
+            (int32_t) packed_prompts,
+            (int32_t) layer,
+            std::move(counts),
+        });
+        loaded_per_length[(int32_t) seq_len]++;
+        info.n_expert = std::max<int32_t>(info.n_expert, (int32_t) routes.back().expert_counts.size());
+    }
+
+    LOG_INF("%s: loaded %zu route distribution(s) from %s\n", __func__, routes.size(), bench.route_jsonl.c_str());
+    return !routes.empty();
 }
 
 static std::vector<llama_token> pack_prompt_tokens(
@@ -2467,6 +2609,7 @@ static void write_report(const std::filesystem::path & path, const bench_params 
     report << "- attention_placement: `" << bench.attention_placement << "`\n";
     report << "- attention_backend_compat: `" << bench.attention_backend << "`\n";
     report << "- prompt_json: `" << (bench.prompt_json.empty() ? "-" : bench.prompt_json) << "`\n";
+    report << "- route_jsonl: `" << (bench.route_jsonl.empty() ? "-" : bench.route_jsonl) << "`\n";
     report << "- route_layer: `" << bench.route_layer << "`\n";
     report << "- route_max_prompts: `" << bench.route_max_prompts << "`\n";
     report << "- repeats: `" << bench.repeats << "`\n";
@@ -2583,7 +2726,9 @@ int main(int argc, char ** argv) {
         if ((info.n_embd <= 0 || info.n_ff_exp <= 0) && !params.model.path.empty()) {
             ok = load_model_info_metadata(params, info) && ok;
         }
-        if (!bench.prompt_json.empty()) {
+        if (!bench.route_jsonl.empty()) {
+            ok = load_route_distributions_jsonl(bench, route_records, info) && ok;
+        } else if (!bench.prompt_json.empty()) {
             std::vector<std::string> owned_patterns;
             const std::string placement = attention_placements_to_run(bench).front();
             common_params route_params = make_run_params(params, bench, bench.mode, placement, bench.n_cpu_moe_layers, owned_patterns);
